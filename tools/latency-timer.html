@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vetro latency timer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #fff; overflow: hidden;
+    font-family: Consolas, "Cascadia Mono", "Courier New", monospace; user-select: none; cursor: pointer; }
+  :fullscreen, :fullscreen body { cursor: none; }
+  body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3vh; }
+  /* 7 glyphs wide: sized from the narrower of width/height so it fills any window */
+  #ms { font-size: min(22vw, 55vh); font-weight: 700; line-height: 1; letter-spacing: 0; white-space: pre; }
+  #bits { display: flex; gap: 1.2vw; }
+  .b { width: 6vw; height: 6vw; max-height: 14vh; max-width: 14vh; box-sizing: border-box; border: .4vmin solid #fff; background: #000; }
+  .b.on { background: #fff; }
+  #lbl { display: flex; gap: 1.2vw; font-size: 1.6vw; color: #ccc; }
+  #lbl span { width: 6vw; max-width: 14vh; text-align: center; }
+  #fr { font-size: min(7vw, 16vh); font-weight: 700; white-space: pre; }
+  #fr i { display: inline-block; width: .8em; height: .8em; vertical-align: -.05em; border: .06em solid #fff; background: #000; }
+  #fr i.on { background: #fff; }
+  #hint { position: fixed; bottom: 1vh; font-size: 1.4vw; color: #888; }
+  :fullscreen #hint { display: none; }
+</style>
+</head>
+<body>
+<div id="ms">000.000</div>
+<div id="bits"></div>
+<div id="lbl"></div>
+<div id="fr">F 0 <i></i></div>
+<div id="hint">ms mod 1&nbsp;000&nbsp;000 &middot; squares = bits of the number shown (1&nbsp;ms &hellip; 2048&nbsp;ms, left = slowest) &middot; click or F: full-screen</div>
+<script>
+"use strict";
+const N = 12;                       // squares: bits of the displayed number m = ms mod 1e6 (not of t: 1e6 is no multiple of 4096)
+const $ = id => document.getElementById(id);
+const bits = [], msEl = $("ms"), frEl = $("fr");
+for (let k = N - 1; k >= 0; k--) {  // most significant on the left, like a binary number
+  const d = document.createElement("div"); d.className = "b"; $("bits").append(d); bits[k] = d;
+  const l = document.createElement("span"); l.textContent = 2 ** k; $("lbl").append(l);
+}
+const ptn = n => String(n).padStart(3, "0");
+let frame = 0;
+function tick() {
+  // timeOrigin + now() = wall-clock epoch ms, identical across windows (unlike Date.now() it keeps sub-ms resolution)
+  const t = Math.floor(performance.timeOrigin + performance.now());
+  const m = t % 1000000;
+  msEl.textContent = ptn(Math.floor(m / 1000)) + "." + ptn(m % 1000);
+  for (let k = 0; k < N; k++) bits[k].classList.toggle("on", (Math.floor(m / 2 ** k) & 1) === 1);
+  frame++;
+  // trailing square flips every frame: shows the frame cadence in a photo
+  frEl.innerHTML = "F " + frame + ' <i class="' + (frame & 1 ? "on" : "") + '"></i>';
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+const toggleFs = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+addEventListener("click", toggleFs);
+addEventListener("keydown", e => { if (!e.repeat && !e.ctrlKey && !e.altKey && !e.metaKey && ["f", "F", "Enter", " "].includes(e.key)) { e.preventDefault(); toggleFs(); } });
+</script>
+</body>
+</html>

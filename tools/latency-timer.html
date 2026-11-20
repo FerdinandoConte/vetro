@@ -7,7 +7,7 @@
 <style>
   html, body { margin: 0; height: 100%; background: #000; color: #fff; overflow: hidden;
     font-family: Consolas, "Cascadia Mono", "Courier New", monospace; user-select: none; cursor: pointer; }
-  :fullscreen { cursor: none; }
+  :fullscreen, :fullscreen body { cursor: none; }
   body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3vh; }
   /* 7 glyphs wide: sized from the narrower of width/height so it fills any window */
   #ms { font-size: min(22vw, 55vh); font-weight: 700; line-height: 1; letter-spacing: 0; white-space: pre; }
@@ -28,10 +28,10 @@
 <div id="bits"></div>
 <div id="lbl"></div>
 <div id="fr">F 0 <i></i></div>
-<div id="hint">ms mod 1&nbsp;000&nbsp;000 &middot; squares = bits of the ms count (1&nbsp;ms &hellip; 2048&nbsp;ms, left = slowest) &middot; click or F: full-screen</div>
+<div id="hint">ms mod 1&nbsp;000&nbsp;000 &middot; squares = bits of the number shown (1&nbsp;ms &hellip; 2048&nbsp;ms, left = slowest) &middot; click or F: full-screen</div>
 <script>
 "use strict";
-const N = 12;                       // squares: bit k flips every 2^k ms
+const N = 12;                       // squares: bits of the displayed number m = ms mod 1e6 (not of t: 1e6 is no multiple of 4096)
 const $ = id => document.getElementById(id);
 const bits = [], msEl = $("ms"), frEl = $("fr");
 for (let k = N - 1; k >= 0; k--) {  // most significant on the left, like a binary number
@@ -45,7 +45,7 @@ function tick() {
   const t = Math.floor(performance.timeOrigin + performance.now());
   const m = t % 1000000;
   msEl.textContent = ptn(Math.floor(m / 1000)) + "." + ptn(m % 1000);
-  for (let k = 0; k < N; k++) bits[k].classList.toggle("on", (Math.floor(t / 2 ** k) & 1) === 1);
+  for (let k = 0; k < N; k++) bits[k].classList.toggle("on", (Math.floor(m / 2 ** k) & 1) === 1);
   frame++;
   // trailing square flips every frame: shows the frame cadence in a photo
   frEl.innerHTML = "F " + frame + ' <i class="' + (frame & 1 ? "on" : "") + '"></i>';
@@ -54,7 +54,7 @@ function tick() {
 requestAnimationFrame(tick);
 const toggleFs = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
 addEventListener("click", toggleFs);
-addEventListener("keydown", e => { if (e.key === "f" || e.key === "F" || e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleFs(); } });
+addEventListener("keydown", e => { if (!e.repeat && !e.ctrlKey && !e.altKey && !e.metaKey && ["f", "F", "Enter", " "].includes(e.key)) { e.preventDefault(); toggleFs(); } });
 </script>
 </body>
 </html>

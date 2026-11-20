@@ -21,8 +21,8 @@ Tempo previsto: ~45 minuti. Prima di iniziare servono: tappa M0-3 fatta (tablet 
 
 ## C. Misurare in Wi-Fi
 7. **[fisico]** Avvia lo streaming del **Desktop**. Su Windows compare un secondo monitor. Verifica in Impostazioni → Schermo che sia in modalità **Estendi**.
-8. **[schermo]** Apri `tools/latency-timer.html` in **Edge** due volte: una finestra sullo schermo del portatile e una trascinata sul monitor del tablet. Ingrandiscile in modo che i numeri si leggano bene.
-9. **[fisico]** Metti il telefono in modo che inquadri **insieme** lo schermo del portatile e il tablet. Scatta **almeno 20 foto** (anche a raffica), a qualche secondo di distanza una dall'altra.
+8. **[schermo]** Apri `tools/latency-timer.html` in **Edge** due volte, in due finestre. Trascina ogni finestra **sul suo schermo** (una sul portatile, una sul monitor del tablet) e solo lì **cliccala o premi F** per metterla a schermo intero (Esc per uscire). Subito prima delle foto, apri o ricarica le due finestre una dopo l'altra, così partono insieme.
+9. **[fisico]** Metti il telefono in modo che inquadri **insieme** lo schermo del portatile e il tablet. Usa l'otturatore più veloce possibile: modalità **sport** o **pro** **1/250 s o più veloce** (per esempio 1/500 s). Scatta **almeno 20 foto** (anche a raffica), a qualche secondo di distanza una dall'altra. Scarta le foto dove il quadrato accanto a "F" è grigio o sfocato: in quelle i numeri non sono affidabili.
 10. **[fisico]** Copia le foto nella cartella `bench/m0-photos/wifi/` del progetto. Claude leggerà i numeri da solo: in ogni foto, numero del portatile meno numero del tablet = ritardo.
 11. **[fisico]** Fai uno screenshot sul tablet con le statistiche di Artemis visibili e mettilo nella stessa cartella.
 

@@ -182,6 +182,8 @@ Per sicurezza, gli agenti non possono installare programmi da soli. Ti mostrano 
 2. Se Windows chiede **"Consentire a questa app di apportare modifiche al dispositivo?"**, premi **Sì**.
 3. Quando ha finito, scrivi nella sessione: `fatto`.
 
+**Scaricare FFmpeg (tappa M0-1):** Claude ti dà il comando `tools\fetch-ffmpeg.ps1` da incollare in PowerShell, dalla cartella del progetto. Scarica circa 80 MB da GitHub e controlla che il file sia quello atteso: se non lo è, si ferma senza installare nulla. Alla fine ti dà un secondo comando, per impostare `FFMPEG_DIR`: incollalo, poi apri un nuovo terminale.
+
 ---
 
 ## 14. Preparare il tablet (una volta sola, tappa M0)

@@ -1,0 +1,16 @@
+/target/
+**/target/
+third_party/
+*.pdb
+.claude/settings.local.json
+.claude/worktrees/
+android/.gradle/
+android/**/build/
+android/local.properties
+android/app/src/main/jniLibs/
+apps/tray/node_modules/
+apps/tray/dist/
+bench/**/raw/
+*.jsonl
+.DS_Store
+Thumbs.db

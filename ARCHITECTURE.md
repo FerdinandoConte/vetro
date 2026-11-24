@@ -195,7 +195,7 @@ vetro/
 ## 14. Build and toolchain
 
 - Rust stable, MSVC target on Windows (requires Visual Studio 2022 Build Tools, C++ workload). Android via `cargo-ndk` for `aarch64-linux-android` (plus `x86_64` for the emulator), NDK 28.
-- FFmpeg: `tools/fetch-ffmpeg.ps1` downloads a pinned BtbN LGPL shared build, verifies its SHA-256, unpacks to `third_party/ffmpeg/` (git-ignored) and sets `FFMPEG_DIR`. Only LGPL builds are ever shipped; GPL-only encoders (x264/x265) are never linked.
+- FFmpeg: `tools/fetch-ffmpeg.ps1` downloads a pinned BtbN LGPL shared build, verifies its SHA-256, unpacks to `third_party/ffmpeg/` (git-ignored) and prints the command that sets `FFMPEG_DIR`. Only LGPL builds are ever shipped; GPL-only encoders (x264/x265) are never linked.
 - Android: AGP with JDK 17, `minSdk 30`, latest `targetSdk`.
 - Release signing: Windows binaries and installer signed in CI through SignPath Foundation; APK signed with the project release key stored as a CI secret.
 

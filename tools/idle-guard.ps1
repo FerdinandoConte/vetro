@@ -90,9 +90,11 @@ function Assert-Policy {
           -and ($Policy.pause -eq $Pause) -and ($Policy.bench_ok -eq $BenchOk)
     if (-not $ok) { throw "SelfTest FAILED: $Name -> $($Policy | ConvertTo-Json -Compress)" }
     Write-Host "ok   $Name"
+    $script:Passed++
 }
 
 function Invoke-SelfTest {
+    $script:Passed = 0
     # Args: idle min, on AC, free RAM GB, CPU %, logical CPUs
     Assert-Policy 'active 5 min, AC, 10 GB, cpu 50, 16 cpus' `
         (Get-IdlePolicy 5 $true 10 50 16) 'owner-active' 8 'below-normal' $false $false
@@ -114,7 +116,19 @@ function Invoke-SelfTest {
         (Get-IdlePolicy 30 $true 10 25 16) 'idle' 16 'normal' $false $false
     Assert-Policy 'idle 30 min, cpu exactly 20 % -> bench not ok' `
         (Get-IdlePolicy 30 $true 10 20 16) 'idle' 16 'normal' $false $false
-    Write-Host 'SelfTest passed (10 cases).'
+    # RAM limits are strict (< 3 GB and < 1 GB): exactly at the limit is not paused.
+    Assert-Policy 'active exactly 3.0 GB free -> pause false' `
+        (Get-IdlePolicy 5 $true 3.0 50 16) 'owner-active' 8 'below-normal' $false $false
+    Assert-Policy 'active 2.999 GB free -> pause' `
+        (Get-IdlePolicy 5 $true 2.999 50 16) 'owner-active' 8 'below-normal' $true $false
+    Assert-Policy 'idle exactly 1.0 GB free -> pause false' `
+        (Get-IdlePolicy 30 $true 1.0 5 16) 'idle' 16 'normal' $false $true
+    Assert-Policy 'idle 0.999 GB free -> pause' `
+        (Get-IdlePolicy 30 $true 0.999 5 16) 'idle' 16 'normal' $true $true
+    # Raw values are compared, not rounded ones: 9.96 min rounds to 10.0 but is still owner-active.
+    Assert-Policy 'active 9.96 min (rounds to 10.0) is owner-active' `
+        (Get-IdlePolicy 9.96 $true 10 5 16) 'owner-active' 8 'below-normal' $false $false
+    Write-Host "SelfTest passed ($script:Passed cases)."
 }
 
 if ($SelfTest) {
@@ -137,18 +151,19 @@ if (-not [VetroNative.Win]::GetSystemPowerStatus([ref]$sps)) { throw 'GetSystemP
 $onAc = ($sps.ACLineStatus -ne 0)
 
 # Free physical RAM (Win32_OperatingSystem reports KB); CPU load: average over all processors (%).
-$os      = Get-CimInstance -ClassName Win32_OperatingSystem
-$freeGb  = [Math]::Round($os.FreePhysicalMemory / 1MB, 2)
-$cpuLoad = [int][Math]::Round((Get-CimInstance -ClassName Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average)
+$os         = Get-CimInstance -ClassName Win32_OperatingSystem
+$freeGbRaw  = $os.FreePhysicalMemory / 1MB
+$cpuLoadRaw = (Get-CimInstance -ClassName Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+$idleMinutesRaw = $idleMs / 60000
 
-$idleMinutes = [Math]::Round($idleMs / 60000, 1)
-$policy = Get-IdlePolicy -IdleMinutes $idleMinutes -OnAc $onAc -FreeRamGb $freeGb -CpuLoadPct $cpuLoad -LogicalCpus ([Environment]::ProcessorCount)
+# The policy uses the raw values; rounding is applied only to the printed JSON.
+$policy = Get-IdlePolicy -IdleMinutes $idleMinutesRaw -OnAc $onAc -FreeRamGb $freeGbRaw -CpuLoadPct $cpuLoadRaw -LogicalCpus ([Environment]::ProcessorCount)
 
 [pscustomobject]@{
     checked_at  = (Get-Date).ToString('o')
-    idle_minutes = $idleMinutes
+    idle_minutes = [Math]::Round($idleMinutesRaw, 1)
     on_ac       = $onAc
-    free_ram_gb = $freeGb
-    cpu_load_pct = $cpuLoad
+    free_ram_gb = [Math]::Round($freeGbRaw, 2)
+    cpu_load_pct = [int][Math]::Round($cpuLoadRaw)
     policy      = $policy
 } | ConvertTo-Json -Depth 4

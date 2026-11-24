@@ -8,7 +8,9 @@
   - Only LGPL builds are used (ARCHITECTURE section 14). GPL-only encoders are never linked.
   - Nothing from the archive is executed except `ffmpeg.exe -hide_banner -encoders` to check for hevc_qsv.
   - No administrator rights needed. It does not change environment variables: it prints the command to run.
-  - If third_party/ffmpeg/bin/ffmpeg.exe already exists, nothing is downloaded; only the encoder check runs.
+  - third_party/ffmpeg/.pin holds the installed asset name. If it matches the pin, nothing is downloaded.
+    If it is missing or differs, the build is downloaded again and replaces the old folder.
+    A folder without bin\ffmpeg.exe is never touched: the script stops and asks you to delete it.
 
 .EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File tools\fetch-ffmpeg.ps1
@@ -18,25 +20,37 @@ param()
 
 $ErrorActionPreference = 'Stop'
 
-# Pinned build: BtbN autobuild of 2026-11-19 (FFmpeg 8.1 line), LGPL shared, win64.
-# To bump: pick a new dated release, copy its asset name and SHA-256 (from the release page or
-# `gh api repos/FFmpeg-Builds/FFmpeg-Builds/releases/tags/<tag>`), and update this block in the same PR.
-$Tag      = 'autobuild-2026-11-19-12-39'
-$Asset    = 'ffmpeg-n8.1.3-36-ge22a4510c9-win64-lgpl-shared-8.1.zip'
-$Sha256   = 'ae947c6f7f87d19cf3de80e448409419a9e81a18987d55ead133c55c2db29e9c'
+# Pinned build: BtbN autobuild of 2026-10-31 (FFmpeg 8.1 line), LGPL shared, win64.
+# pin month-end builds only (kept 2 years; dailies 14)
+# To bump: pick a new month-end release, copy its asset name and SHA-256 (from `gh api repos/FFmpeg-Builds/FFmpeg-Builds/releases/tags/<tag>`),
+# confirm the SHA-256 after downloading, and update this block in the same PR.
+$Tag      = 'autobuild-2026-10-31-12-59'
+$Asset    = 'ffmpeg-n8.1.3-27-g8dca1586f4-win64-lgpl-shared-8.1.zip'
+$Sha256   = '5cef7bc48e513f3cee7c881e8b2999d835541edb1846c3e89443a67f8f8556ab'
 $Url      = "https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/$Tag/$Asset"
 
-$RepoRoot = Split-Path -Parent $PSScriptRoot
-$Dest     = Join-Path $RepoRoot 'third_party\ffmpeg'
-$Ffmpeg   = Join-Path $Dest 'bin\ffmpeg.exe'
+$RepoRoot   = Split-Path -Parent $PSScriptRoot
+$ThirdParty = Join-Path $RepoRoot 'third_party'
+$Dest       = Join-Path $ThirdParty 'ffmpeg'
+$Ffmpeg     = Join-Path $Dest 'bin\ffmpeg.exe'
+$Pin        = Join-Path $Dest '.pin'
 
 # GitHub requires TLS 1.2; Windows PowerShell 5.1 may default to older protocols.
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $ProgressPreference = 'SilentlyContinue'
 
-if (-not (Test-Path $Ffmpeg)) {
-    # Fresh, empty working directory for the download and the unpacked archive.
-    $Work = Join-Path ([IO.Path]::GetTempPath()) ('vetro-ffmpeg-' + [guid]::NewGuid().ToString('N'))
+$installedAsset = if (Test-Path $Pin) { (Get-Content -Path $Pin -Raw).Trim() } else { '' }
+
+if ((Test-Path $Ffmpeg) -and ($installedAsset -eq $Asset)) {
+    Write-Host "Already installed: $Ffmpeg (pin matches $Asset; not downloaded again)."
+} else {
+    # Checked before the download: an unknown folder is never deleted.
+    if ((Test-Path $Dest) -and -not (Test-Path $Ffmpeg)) {
+        throw "$Dest exists without bin\ffmpeg.exe. Delete that folder and run again."
+    }
+    New-Item -ItemType Directory -Path $ThirdParty -Force | Out-Null
+    # Empty working folder inside third_party (same drive as the destination, so Move-Item works).
+    $Work = Join-Path $ThirdParty ('download-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $Work | Out-Null
     try {
         $Zip = Join-Path $Work $Asset
@@ -56,15 +70,18 @@ if (-not (Test-Path $Ffmpeg)) {
         # The archive has one top-level folder; its contents (bin, include, lib, ...) become third_party/ffmpeg.
         $Inner = @(Get-ChildItem -Path $Unpacked -Directory)
         if ($Inner.Count -ne 1) { throw "Unexpected archive layout: $($Inner.Count) top-level folders." }
-        if (Test-Path $Dest) { throw "$Dest exists without bin\ffmpeg.exe. Delete that folder and run again." }
-        New-Item -ItemType Directory -Path (Split-Path -Parent $Dest) -Force | Out-Null
+
+        # Replace our earlier install of another build (it has bin\ffmpeg.exe, checked above).
+        if (Test-Path $Dest) {
+            Write-Host "Replacing $Dest (installed: '$installedAsset', pinned: '$Asset')."
+            Remove-Item -Recurse -Force -Path $Dest
+        }
         Move-Item -Path $Inner[0].FullName -Destination $Dest
+        Set-Content -Path $Pin -Value $Asset -Encoding ascii
     }
     finally {
         Remove-Item -Recurse -Force -Path $Work -ErrorAction SilentlyContinue
     }
-} else {
-    Write-Host "Already installed: $Ffmpeg (not downloaded again)."
 }
 
 if (-not (Test-Path $Ffmpeg)) { throw "ffmpeg.exe not found at $Ffmpeg" }

@@ -67,6 +67,10 @@ $cat = Get-ChildItem -Path (Join-Path $work 'pkg') -Recurse -Filter 'MttVDD.cat'
 if (-not $inf -or -not $cat) { throw 'MttVDD.inf or MttVDD.cat not found in the archive.' }
 $sig = Get-AuthenticodeSignature -FilePath $cat.FullName
 if ($sig.Status -ne 'Valid') { throw "Driver catalog signature is $($sig.Status), refusing to install." }
+# VDD releases are signed through SignPath; a Microsoft attestation-signed catalog is also acceptable.
+if ($sig.SignerCertificate.Subject -notmatch '^CN=(SignPath Foundation|Microsoft Windows Hardware Compatibility Publisher),') {
+    throw "Unexpected catalog signer: $($sig.SignerCertificate.Subject), refusing to install."
+}
 Write-Host "Catalog signed by: $($sig.SignerCertificate.Subject)"
 
 New-Item -ItemType Directory -Path $ConfDir -Force | Out-Null

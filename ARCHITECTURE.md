@@ -230,7 +230,7 @@ Client: any Android 11+ device with a hardware H.264/HEVC decoder. AV1 needs e.g
 | R1 | Iris Xe may not sustain HEVC 2960×1848 @120 fps within the 5 ms encode budget, or may throttle in a 30-minute soak | M0 (FFmpeg `ddagrab` + `hevc_qsv` spike, Apollo baseline), M1 soak |
 | R2 | A Wi-Fi-only Tab S8 Ultra may not offer USB tethering at all | M0 (check on device) |
 | R3 | USB tethering can steal the PC's default route; fixing the interface metric may need admin rights | M1 |
-| R4 | AOA on Windows needs WinUSB bound to `18D1:2D00/2D01` and a way to send the AOA start requests | M0-7: neither works on a stock PC without a driver install ([ADR-0016](docs/adr/0016-aoa-on-windows.md)); M2 pre-spike |
+| R4 | AOA on Windows needs WinUSB bound to `18D1:2D00/2D01` and a way to send the AOA start requests | M0-7: does not work on a stock PC without developer options and a driver install ([ADR-0016](docs/adr/0016-aoa-on-windows.md), Proposed); M2 pre-spike |
 | R5 | VDD control interface, mode-switch time, DWM honouring 120 Hz on the virtual monitor | M1 spike |
 | R6 | QUIC overhead or pacing vs raw UDP | M1 measurement; exit plan in [ADR-0006](docs/adr/0006-transport-quic.md) |
 | R7 | Samsung adaptive refresh honouring `setFrameRate` at 120 Hz | M1 |

@@ -7,7 +7,8 @@
 # because adb holds that WinUSB handle exclusively. Undo Start with `adb shell svc usb setFunctions <original>`.
 param(
   [ValidateSet('Protocol', 'Start', 'Descriptors')] [string]$Mode = 'Protocol',
-  [Guid]$InterfaceGuid = 'F72FE0D4-CBCB-407d-8814-9ED673D0DD6B'
+  [Guid]$InterfaceGuid = 'F72FE0D4-CBCB-407d-8814-9ED673D0DD6B',
+  [int]$Index = -1  # which interface to use when several devices match; required then
 )
 $ErrorActionPreference = 'Stop'
 Add-Type -TypeDefinition @'
@@ -41,12 +42,21 @@ public static class AoaProbe {
 '@
 $paths = [AoaProbe]::Paths($InterfaceGuid)
 "Interfaces for {$InterfaceGuid}: $($paths.Count)"
+for ($i = 0; $i -lt $paths.Count; $i++) { "  [$i] $($paths[$i])" }
 if ($paths.Count -eq 0) { return }
+if ($Index -lt 0) {
+  if ($paths.Count -gt 1) { throw "More than one device matches; pass -Index to choose one." }
+  $Index = 0
+}
+if ($Index -ge $paths.Count) { throw "-Index $Index is out of range." }
+"Using [$Index]"
 # GENERIC_READ|GENERIC_WRITE, share read/write, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL|FILE_FLAG_OVERLAPPED (WinUSB requires it)
-$h = [AoaProbe]::CreateFile($paths[0], [uint32]3221225472, 3, [IntPtr]::Zero, 3, 0x40000080, [IntPtr]::Zero)
+$h = [AoaProbe]::CreateFile($paths[$Index], [uint32]3221225472, 3, [IntPtr]::Zero, 3, 0x40000080, [IntPtr]::Zero)
 if ($h.IsInvalid) { throw "CreateFile failed: Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()) (adb still running?)" }
 $w = [IntPtr]::Zero
-if (-not [AoaProbe]::WinUsb_Initialize($h, [ref]$w)) { throw "WinUsb_Initialize failed: Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" }
+try {
+  if (-not [AoaProbe]::WinUsb_Initialize($h, [ref]$w)) { throw "WinUsb_Initialize failed: Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" }
+} catch { $h.Dispose(); throw }
 
 function Invoke-Ctl([byte]$Type, [byte]$Req, [uint16]$Value, [uint16]$Index, [byte[]]$Buf) {
   $sp = New-Object AoaProbe+SP; $sp.T = $Type; $sp.R = $Req; $sp.V = $Value; $sp.I = $Index; $sp.L = $Buf.Length
@@ -58,7 +68,9 @@ function Get-Desc([uint16]$Value, [int]$Len) { Invoke-Ctl 0x80 6 $Value 0 ([byte
 try {
   if ($Mode -ne 'Descriptors') {
     $p = Invoke-Ctl 0xC0 51 0 0 ([byte[]]::new(2))  # ACCESSORY_GET_PROTOCOL: IN | vendor | device
-    "51 GET_PROTOCOL: ok=$($p.ok) err=$($p.err) version=$($p.b[0] + 256 * $p.b[1])"
+    $version = $p.b[0] + 256 * $p.b[1]
+    "51 GET_PROTOCOL: ok=$($p.ok) err=$($p.err) version=$version"
+    if (-not $p.ok -or $p.n -lt 2 -or $version -eq 0) { throw "Device does not support AOA; not sending 52/53." }
   }
   if ($Mode -eq 'Start') {
     $strings = 'Vetro contributors', 'Vetro', 'Vetro M0-7 AOA probe', '0.0.1', 'https://example.invalid/vetro', '0'

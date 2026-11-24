@@ -34,13 +34,14 @@ param(
     [ValidateSet('bgra', 'nv12')][string]$PixFmt = 'bgra',
     [int]$BitrateMbps = 80,
     [switch]$Page,
-    [string]$OutDir = (Join-Path (Split-Path -Parent $PSScriptRoot) 'bench\raw\m0-encode'),
+    [string]$OutDir = '',  # default bench\raw\m0-encode, set below: $PSScriptRoot is empty in param defaults on PS 5.1
     [string]$LogDir = (Join-Path $env:TEMP 'vetro-bench'),
     [switch]$SelfTest
 )
 
 $ErrorActionPreference = 'Stop'
 $IdleGuard = Join-Path $PSScriptRoot 'idle-guard.ps1'
+if (-not $OutDir) { $OutDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'bench\raw\m0-encode' }
 $WarmupSeconds = 5
 
 function Get-Percentile([double[]]$Sorted, [double]$P) {

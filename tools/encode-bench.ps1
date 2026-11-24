@@ -141,8 +141,8 @@ $sampler = Start-Job -ArgumentList $IdleGuard -ScriptBlock {
 $edge = $null
 if ($Page) {
     Add-Type -AssemblyName System.Windows.Forms
-    $screen = [System.Windows.Forms.Screen]::AllScreens | Where-Object { -not $_.Primary } | Select-Object -First 1
-    if (-not $screen) { throw 'No secondary (virtual) monitor found for -Page.' }
+    # shortcut: the virtual monitor is taken to be the largest screen (true on the reference laptop), whether or not it is primary.
+    $screen = [System.Windows.Forms.Screen]::AllScreens | Sort-Object { $_.Bounds.Width * $_.Bounds.Height } -Descending | Select-Object -First 1
     $msedge = Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe'
     $profileDir = Join-Path $LogDir 'edge-profile'
     $pageUrl = ([Uri](Join-Path $PSScriptRoot 'latency-timer.html')).AbsoluteUri
@@ -215,6 +215,7 @@ $summary = [ordered]@{
     label = $Label; mode = $Mode; started = $guardStart.checked_at; seconds = $Seconds
     settings = [ordered]@{ fps = $Fps; output_idx = $OutputIdx; input = $PixFmt; bitrate_mbps = $BitrateMbps; page = [bool]$Page }
     ffmpeg_exit = $exit
+    captured_size = (Select-String -Path $log -Pattern 'Stream #0:0: Video: .*?(\d{3,5}x\d{3,5})' | Select-Object -First 1).Matches.Groups[1].Value
     noisy = $noisy; guard_start = $guardStart; idle_checks = $idleSamples.Count; stayed_idle_on_ac = [bool]$stayedIdle
     fps_per_second_after_warmup = $fpsStats
     encode_ms = $enc

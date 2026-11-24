@@ -14,3 +14,5 @@ bench/**/raw/
 *.jsonl
 .DS_Store
 Thumbs.db
+bench/m0-photos/
+bench/m0-controllo.md

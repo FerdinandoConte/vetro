@@ -236,3 +236,4 @@ Client: any Android 11+ device with a hardware H.264/HEVC decoder. AV1 needs e.g
 | R7 | Samsung adaptive refresh honouring `setFrameRate` at 120 Hz | M1 |
 | R8 | Gesture navigation stealing edge swipes | M1 (documented limitation) |
 | R9 | FFmpeg D3D11→QSV zero-copy latency and stability | M1 spike; fallback: native oneVPL backend behind the `Encoder` trait |
+| R10 | Content on a secondary 120 Hz virtual monitor may render at the primary panel's 60 Hz (seen with Edge in the M0 baseline), which would cap the stream and blind the §11 timer method | M0-5 check while VDD is installed, recorded in M0-8 |

@@ -2,7 +2,7 @@
 
 Reference point for Vetro: how fast an existing open-source stack (Apollo host → Artemis client) is on the reference hardware. Method: [ARCHITECTURE §11](../ARCHITECTURE.md#11-telemetry-and-measurement), checklist [`docs/manual-tests/m0-baseline.md`](../docs/manual-tests/m0-baseline.md), timer page [`tools/latency-timer.html`](../tools/latency-timer.html).
 
-**Δ** = timer value on the laptop panel − timer value on the tablet, read from the same phone photo (Pro mode, 1/500 s). Each reading was cross-checked against the page's binary squares. A photo counts only when both counters can be resolved and neither frame square is mid-transition. If the laptop panel is caught mid-refresh (torn), the value of the squares is used, which is the older frame. If the tablet panel is torn, the photo is rejected. This rule affects 4 Wi-Fi samples: reading the newer digits instead would give 66/67/67/66 rather than 50/50/50/50, but p50 and p95 stay the same. Δ excludes the laptop panel's own display latency, by design (§4).
+**Δ** = timer value on the laptop panel − timer value on the tablet, read from the same phone photo (Pro mode, 1/500 s). Each reading was cross-checked against the page's binary squares. A photo counts only when both counters can be resolved and neither frame square is mid-transition. If the laptop panel is caught mid-refresh (torn), the value of the squares is used, which is the older frame. If the tablet panel is torn, the photo is rejected. This rule affects 4 Wi-Fi samples: reading the newer digits instead would give 66/67/67/66 rather than 50/50/51/49, but p50 and p95 stay the same. Δ excludes the laptop panel's own display latency, by design (§4).
 
 ## Setup
 | | |

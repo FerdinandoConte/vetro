@@ -19,3 +19,4 @@ One file per decision. Format: Status · Context · Decision · Consequences · 
 | [0013](0013-out-of-scope.md) | Out of scope: offloading, audio mixing, bonding, X11 |
 | [0014](0014-licensing-distribution.md) | MIT OR Apache-2.0, free forever, signed releases, no telemetry |
 | [0015](0015-development-process.md) | Local Claude Code agents with quality gates and an ask-first autopilot |
+| [0016](0016-aoa-on-windows.md) | AOA on Windows needs a one-time driver install; M2 AOA conditional on a pre-spike (Proposed) |

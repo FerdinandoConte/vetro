@@ -141,8 +141,9 @@ $sampler = Start-Job -ArgumentList $IdleGuard -ScriptBlock {
 $edge = $null
 if ($Page) {
     Add-Type -AssemblyName System.Windows.Forms
-    # shortcut: the virtual monitor is taken to be the largest screen (true on the reference laptop), whether or not it is primary.
-    $screen = [System.Windows.Forms.Screen]::AllScreens | Sort-Object { $_.Bounds.Width * $_.Bounds.Height } -Descending | Select-Object -First 1
+    # The virtual monitor is the screen closest to the tablet's 2960:1848 aspect; aspect survives DPI virtualisation, area does not.
+    # shortcut: assumes the laptop panel's aspect differs (16:9 on the reference laptop); match by device name when that stops holding.
+    $screen = [System.Windows.Forms.Screen]::AllScreens | Sort-Object { [Math]::Abs($_.Bounds.Width / $_.Bounds.Height - 2960 / 1848) } | Select-Object -First 1
     $msedge = Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe'
     $profileDir = Join-Path $LogDir 'edge-profile'
     $pageUrl = ([Uri](Join-Path $PSScriptRoot 'latency-timer.html')).AbsoluteUri

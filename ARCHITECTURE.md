@@ -151,7 +151,7 @@ Threats considered: passive sniffing and active MITM on the LAN; an unpaired dev
 |---|---|---|
 | Wi-Fi (LAN) | M1 | Client holds `WIFI_MODE_FULL_LOW_LATENCY`. 2.4 GHz is shown as "not recommended". |
 | USB tethering | M1 | IP over USB (RNDIS/NCM), same code as Wi-Fi. The tablet must offer USB tethering (verified in M0). The engine detects the tethering interface and must keep it from becoming the PC's default route (fix verified in M1). |
-| AOA | M2 | QUIC packets carried over USB bulk endpoints through a custom `quinn` socket adapter; no developer options, app opens on plug. Windows driver binding decided in the M0 spike. |
+| AOA | M2 | QUIC packets carried over USB bulk endpoints through a custom `quinn` socket adapter; no developer options, app opens on plug. Needs a one-time admin driver install on Windows (WinUSB INF for the accessory interface + a start helper); conditional on the M2 pre-spike, see [ADR-0016](docs/adr/0016-aoa-on-windows.md). |
 | Failover | M3 | Both paths kept warm; QUIC connection migration; 100–300 ms glitch + keyframe on switch. No bonding. |
 
 ## 10. Real-time rules for the hot path
@@ -230,7 +230,7 @@ Client: any Android 11+ device with a hardware H.264/HEVC decoder. AV1 needs e.g
 | R1 | Iris Xe may not sustain HEVC 2960×1848 @120 fps within the 5 ms encode budget, or may throttle in a 30-minute soak | M0 (FFmpeg `ddagrab` + `hevc_qsv` spike, Apollo baseline), M1 soak |
 | R2 | A Wi-Fi-only Tab S8 Ultra may not offer USB tethering at all | M0 (check on device) |
 | R3 | USB tethering can steal the PC's default route; fixing the interface metric may need admin rights | M1 |
-| R4 | AOA on Windows needs WinUSB bound to `18D1:2D00/2D01` and a way to send the AOA start requests | M0 spike, M2 |
+| R4 | AOA on Windows needs WinUSB bound to `18D1:2D00/2D01` and a way to send the AOA start requests | M0-7: does not work on a stock PC without developer options and a driver install ([ADR-0016](docs/adr/0016-aoa-on-windows.md), Proposed); M2 pre-spike |
 | R5 | VDD control interface, mode-switch time, DWM honouring 120 Hz on the virtual monitor | M1 spike |
 | R6 | QUIC overhead or pacing vs raw UDP | M1 measurement; exit plan in [ADR-0006](docs/adr/0006-transport-quic.md) |
 | R7 | Samsung adaptive refresh honouring `setFrameRate` at 120 Hz | M1 |

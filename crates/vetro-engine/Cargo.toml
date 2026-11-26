@@ -1,0 +1,9 @@
+[package]
+name = "vetro-engine"
+description = "Vetro host binary: capture, virtual display control, input injection, IPC, telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true

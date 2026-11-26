@@ -54,6 +54,27 @@ jobs:
       - run: cargo deny check
       - run: cargo audit
 
+  # Short libFuzzer smoke run of the protocol parsers (ARCHITECTURE section 15); longer runs are nightly.
+  # Not a required check: a new crash shows up here first, and is fixed before merge by review.
+  fuzz-smoke:
+    name: fuzz-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: nightly
+      # install-action has no cargo-fuzz manifest at this pin, so build it from crates.io (locked).
+      - run: cargo +nightly install cargo-fuzz --version 0.13.2 --locked
+      - name: Fuzz vetro-protocol for 60 s
+        working-directory: crates/vetro-protocol
+        run: cargo +nightly fuzz run protocol -- -max_total_time=60 -rss_limit_mb=1024
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: crates/vetro-protocol/fuzz/artifacts/
+
   android:
     name: android
     runs-on: ubuntu-latest

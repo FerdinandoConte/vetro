@@ -5,12 +5,13 @@ plugins {
 
 android {
     namespace = "dev.vetro.app"
-    compileSdk = 35
+    compileSdk = 36
+    ndkVersion = "28.2.13676358" // r28c, same NDK as cargo-ndk in CI
 
     defaultConfig {
         applicationId = "dev.vetro.app"
         minSdk = 30
-        targetSdk = 35
+        targetSdk = 36
         versionCode = 1
         versionName = "0.0.0"
         ndk { abiFilters += "arm64-v8a" }

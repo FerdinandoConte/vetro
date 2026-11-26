@@ -26,7 +26,10 @@ fn main() {
                 };
                 next_id += 1;
                 let t0 = Instant::now();
-                let dgrams: Vec<&[u8]> = fragmenter.fragment(info, &frame, MTU, fec).unwrap().collect();
+                let dgrams: Vec<&[u8]> = fragmenter
+                    .fragment(info, &frame, MTU, fec)
+                    .unwrap()
+                    .collect();
                 t_frag += t0.elapsed().as_nanos();
                 let dgrams: Vec<Vec<u8>> = dgrams.into_iter().map(<[u8]>::to_vec).collect();
                 let t1 = Instant::now();
@@ -50,7 +53,11 @@ fn main() {
                 assert!(done, "frame {i} not recovered");
             }
             let us = |ns: u128| ns as f64 / f64::from(ITERS) / 1000.0;
-            let loss = if lose_every > 0 { 100.0 / lose_every as f64 } else { 0.0 };
+            let loss = if lose_every > 0 {
+                100.0 / lose_every as f64
+            } else {
+                0.0
+            };
             println!(
                 "frame {frame_bytes:>8} B  fec {fec:>2}%  loss {loss:>4.1}%  fragment {:>8.1} us  reassemble {:>8.1} us",
                 us(t_frag),

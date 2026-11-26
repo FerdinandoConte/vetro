@@ -5,7 +5,15 @@
 //! is older than a frame that just completed (it could only be decoded out of order), when it is
 //! still incomplete `frame_timeout_us` after its first fragment (ARCHITECTURE section 7), or when
 //! a newer frame needs its slot (fresh beats complete, section 10). Every frame that leaves without
-//! completing counts in [`Reassembler::lost_frames`]; the client answers with `KeyframeRequest`.
+//! completing counts in [`Reassembler::lost_frames`], and so does every frame id skipped entirely
+//! (no fragment ever arrived); [`Reassembler::last_lost_frame`] names the newest one for
+//! `KeyframeRequest`.
+//!
+//! The host numbers frames +1 per frame for the whole connection, also across encoder resets. As
+//! a safety net, a new frame id more than [`RESTART_WINDOW`] frames *older* than the newest
+//! finished frame is taken as a numbering restart: everything in flight is dropped and
+//! [`Reassembler::stream_restarts`] grows (request a keyframe). A smaller backwards step is a late
+//! fragment and is ignored.
 //!
 //! Allocation: slot buffers and the Reed–Solomon work space grow to their high-water mark during
 //! the first frames and are reused afterwards, so steady-state reassembly allocates nothing.
@@ -140,6 +148,11 @@ impl Slot {
     }
 }
 
+/// A fragment of a frame up to this many frames older than the newest finished one is late and
+/// ignored; further back means the host restarted its numbering. 64 frames is over 0.5 s at 120 Hz,
+/// far past the one-interval timeout, and bounds the freeze after a host-side reset.
+pub const RESTART_WINDOW: u32 = 64;
+
 /// `a` is newer than `b` in wrapping (RFC 1982) order.
 fn is_newer(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) > 0
@@ -152,6 +165,8 @@ pub struct Reassembler {
     /// Newest frame that left a slot (completed or dropped).
     last_finished: Option<u32>,
     lost: u64,
+    last_lost: Option<u32>,
+    restarts: u64,
 }
 
 impl Reassembler {
@@ -167,20 +182,32 @@ impl Reassembler {
             decoder: None,
             last_finished: None,
             lost: 0,
+            last_lost: None,
+            restarts: 0,
         }
     }
 
-    pub fn config(&self) -> ReassemblerConfig {
-        self.cfg
-    }
-
-    /// Frames that left without completing, since creation. When it grows, request a keyframe.
+    /// Frames lost since creation: dropped incomplete, or skipped without a single fragment.
+    /// When it grows, send `KeyframeRequest { lost_frame_id: last_lost_frame() }`.
     pub fn lost_frames(&self) -> u64 {
         self.lost
     }
 
+    /// Newest lost frame id (wrapping order), if any.
+    pub fn last_lost_frame(&self) -> Option<u32> {
+        self.last_lost
+    }
+
+    /// Times the host's frame numbering jumped backwards (see [`RESTART_WINDOW`]). When it grows,
+    /// request a keyframe.
+    pub fn stream_restarts(&self) -> u64 {
+        self.restarts
+    }
+
     /// Bytes held in frame buffers. Never more than `max_in_flight × (max_frame_bytes +
-    /// MAX_FRAGMENTS)`, whatever the peer sends.
+    /// MAX_FRAGMENTS)`, whatever the peer sends. Not included: the Reed–Solomon decoder work
+    /// space, which `reed-solomon-simd` sizes from one frame's shard count and size, so it is
+    /// bounded by a small multiple of `max_frame_bytes`.
     pub fn buffered_bytes(&self) -> usize {
         self.slots
             .iter()
@@ -230,11 +257,13 @@ impl Reassembler {
                 i
             }
             None => {
-                if self
-                    .last_finished
-                    .is_some_and(|l| !is_newer(header.frame_id, l))
-                {
-                    return Ok(PushOutcome::Ignored);
+                if let Some(l) = self.last_finished {
+                    if !is_newer(header.frame_id, l) {
+                        if l.wrapping_sub(header.frame_id) <= RESTART_WINDOW {
+                            return Ok(PushOutcome::Ignored);
+                        }
+                        self.restart();
+                    }
                 }
                 let count = usize::from(header.frag_count);
                 let data = usize::from(header.data_count());
@@ -321,14 +350,56 @@ impl Reassembler {
     fn drop_slot(&mut self, i: usize) {
         self.slots[i].active = false;
         self.lost += 1;
-        self.retire(self.slots[i].info.frame_id);
+        let id = self.slots[i].info.frame_id;
+        self.note_lost(id);
+        self.retire(id);
     }
 
+    /// `frame_id` left a slot. Ids between the previous newest finished frame and `frame_id`
+    /// that never got a slot were lost without a single fragment arriving.
     fn retire(&mut self, frame_id: u32) {
-        match self.last_finished {
-            Some(l) if !is_newer(frame_id, l) => {}
-            _ => self.last_finished = Some(frame_id),
+        if let Some(l) = self.last_finished {
+            if !is_newer(frame_id, l) {
+                return;
+            }
+            let between = |id: u32| is_newer(id, l) && is_newer(frame_id, id);
+            let in_flight = self
+                .slots
+                .iter()
+                .filter(|s| s.active && between(s.info.frame_id))
+                .count() as u64;
+            // is_newer(frame_id, l) guarantees a difference of at least 1.
+            let gap = u64::from(frame_id.wrapping_sub(l) - 1);
+            if gap > in_flight {
+                self.lost += gap - in_flight;
+                let mut id = frame_id.wrapping_sub(1);
+                while self.slots.iter().any(|s| s.active && s.info.frame_id == id) {
+                    id = id.wrapping_sub(1);
+                }
+                self.note_lost(id);
+            }
         }
+        self.last_finished = Some(frame_id);
+    }
+
+    fn note_lost(&mut self, id: u32) {
+        match self.last_lost {
+            Some(l) if !is_newer(id, l) => {}
+            _ => self.last_lost = Some(id),
+        }
+    }
+
+    /// The host's numbering went backwards: forget everything in flight and start over.
+    fn restart(&mut self) {
+        for s in &mut self.slots {
+            if s.active {
+                s.active = false;
+                self.lost += 1;
+            }
+        }
+        self.last_finished = None;
+        self.last_lost = None;
+        self.restarts += 1;
     }
 }
 
@@ -420,6 +491,54 @@ mod tests {
             );
             assert_eq!(got, vec![(info(id), frame, 0)]);
         }
+        assert_eq!(r.lost_frames(), 0);
+    }
+
+    #[test]
+    fn skipped_frame_counts_as_lost() {
+        let mut r = Reassembler::new(cfg());
+        assert_eq!(feed(&mut r, 0, &fragments(1, &[1; 10], 1200, 0)).len(), 1);
+        assert_eq!(r.last_lost_frame(), None);
+        assert_eq!(feed(&mut r, 0, &fragments(3, &[3; 10], 1200, 0)).len(), 1);
+        assert_eq!(r.lost_frames(), 1);
+        assert_eq!(r.last_lost_frame(), Some(2));
+    }
+
+    #[test]
+    fn skipped_frames_across_the_wrap_count_as_lost() {
+        let mut r = Reassembler::new(cfg());
+        feed(&mut r, 0, &fragments(u32::MAX - 1, &[1; 10], 1200, 0));
+        feed(&mut r, 0, &fragments(1, &[1; 10], 1200, 0));
+        assert_eq!(r.lost_frames(), 2);
+        assert_eq!(r.last_lost_frame(), Some(0));
+    }
+
+    #[test]
+    fn skipped_frame_is_not_double_counted_with_an_in_flight_one() {
+        let mut r = Reassembler::new(cfg());
+        feed(&mut r, 0, &fragments(1, &[1; 10], 1200, 0));
+        let two = fragments(2, &[2; 5000], 1200, 0);
+        assert!(feed(&mut r, 0, &two[..1]).is_empty());
+        // 2 is in flight (dropped when 4 completes), 3 never arrived: two lost, newest 3.
+        feed(&mut r, 0, &fragments(4, &[4; 10], 1200, 0));
+        assert_eq!(r.lost_frames(), 2);
+        assert_eq!(r.last_lost_frame(), Some(3));
+    }
+
+    #[test]
+    fn host_numbering_restart_is_detected() {
+        let mut r = Reassembler::new(cfg());
+        for id in 1000..1004 {
+            feed(&mut r, 0, &fragments(id, &[1; 10], 1200, 0));
+        }
+        // Within the window: a late frame, ignored.
+        let late = 1003 - RESTART_WINDOW;
+        assert!(feed(&mut r, 0, &fragments(late, &[1; 10], 1200, 0)).is_empty());
+        assert_eq!(r.stream_restarts(), 0);
+        // Further back: the host restarted its numbering; frames flow again.
+        assert_eq!(feed(&mut r, 0, &fragments(0, &[7; 10], 1200, 0)).len(), 1);
+        assert_eq!(r.stream_restarts(), 1);
+        assert_eq!(feed(&mut r, 0, &fragments(1, &[7; 10], 1200, 0)).len(), 1);
         assert_eq!(r.lost_frames(), 0);
     }
 
@@ -609,7 +728,11 @@ mod tests {
         #[test]
         fn hostile_fragments_stay_bounded(
             frags in proptest::collection::vec(
-                (0u32..6, 0u16..40, 0u16..40, 0u8..40, 0u64..3, 0usize..1400, 0u64..20_000),
+                (
+                    0u32..6, 0u16..40, 0u16..40, 0u8..40, 0u64..3, 0usize..1400, 0u64..20_000,
+                    // Mostly no jump; sometimes a large gap forward, half the id space, or backwards.
+                    proptest::sample::select(vec![0u32, 0, 0, 0, 1 << 20, 1 << 31, u32::MAX - 100]),
+                ),
                 0..300,
             ),
             big in any::<bool>(),
@@ -617,11 +740,14 @@ mod tests {
             let cfg = ReassemblerConfig { max_in_flight: 3, max_frame_bytes: 256 * 1024, frame_timeout_us: 8_333 };
             let mut r = Reassembler::new(cfg);
             let mut now = 0;
+            let mut base = 0u32;
             let bound = cfg.max_in_flight * (cfg.max_frame_bytes + usize::from(MAX_FRAGMENTS));
-            for (id, idx, count, parity, ts, len, dt) in frags {
+            for (off, idx, count, parity, ts, len, dt, jump) in frags {
                 now += dt;
+                base = base.wrapping_add(jump);
+                let id = base.wrapping_add(off);
                 // Small counts collide and complete often; `big` also tries huge announced frames.
-                let count = if big && id == 5 { MAX_FRAGMENTS - count } else { count };
+                let count = if big && off == 5 { MAX_FRAGMENTS - count } else { count };
                 let header = FragmentHeader {
                     frame_id: id,
                     frag_index: idx,

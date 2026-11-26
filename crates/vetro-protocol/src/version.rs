@@ -4,6 +4,10 @@
 //! fail at the TLS handshake already. Within one major, minors are backwards compatible: the
 //! session runs at the lower of the two minors, and features added in a later minor are used only
 //! when the negotiated minor allows it.
+//!
+//! A minor may only add enum variants (new messages or new enum values); structs are frozen
+//! within a major, because postcard is not self-describing. Each side sends only `Hello` until
+//! the peer's `Hello` has arrived. See [`crate::messages`] for the full rules.
 
 use serde::{Deserialize, Serialize};
 

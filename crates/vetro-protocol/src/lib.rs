@@ -12,6 +12,8 @@
 //!   reassembly with FEC recovery.
 //! - [`version`]: protocol version and negotiation.
 #![forbid(unsafe_code)]
+// Macros bypass clippy.toml's disallowed-methods, so printing is denied here.
+#![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 
 pub mod datagram;
 mod error;
@@ -22,7 +24,9 @@ pub mod version;
 
 pub use error::{DecodeError, EncodeError};
 pub use fragment::{FragmentError, Fragmenter};
-pub use reassembly::{Frame, PushOutcome, Reassembler, ReassemblerConfig, ReassemblyError};
+pub use reassembly::{
+    Frame, PushOutcome, RESTART_WINDOW, Reassembler, ReassemblerConfig, ReassemblyError,
+};
 
 /// Largest total payload of one frame's fragments, parity included (8 MiB).
 ///

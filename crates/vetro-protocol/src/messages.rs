@@ -3,10 +3,16 @@
 //! Wire format of every stream: a sequence of frames `[len: u32 LE][postcard bytes]`, one message
 //! per frame, `len` at most the stream's limit ([`StreamMessage::MAX_BYTES`]).
 //!
-//! Enums are append-only: a variant's tag is its position, so new variants go at the end and
-//! existing ones are never reordered or removed. postcard rejects unknown tags. The tag of every
-//! variant is pinned by a test. `ControlMessage::Hello` is tag 0 and its leading `Version` is
-//! frozen forever, so any two builds can read each other's `Hello`.
+//! Evolution rules. postcard is not self-describing and decoding rejects trailing bytes, so:
+//! - **Structs are frozen within a major version**: no field is added, removed, reordered or
+//!   retyped. A change to a struct means a new major.
+//! - **Extend only with new enum variants**, appended at the end (a variant's tag is its
+//!   position; existing ones are never reordered or removed). postcard rejects unknown tags, and
+//!   a test pins every tag.
+//! - **Send only `Hello` until the peer's `Hello` arrives**; after that, send a variant added in
+//!   minor *m* only if the negotiated minor is ≥ *m* ([`crate::version::negotiate`]).
+//! - `ControlMessage::Hello` is tag 0 and its leading `Version` is frozen forever, so any two
+//!   builds can read each other's `Hello`.
 
 use crate::version::Version;
 use crate::{DecodeError, EncodeError};
@@ -141,10 +147,22 @@ pub struct Hello {
     pub pair_token: Option<PairToken>,
 }
 
-/// 128-bit one-time pairing token. `Debug` never prints it.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// 128-bit one-time pairing token. `Debug` never prints it; `==` takes the same time whatever
+/// the bytes.
+#[derive(Clone, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(proptest_derive::Arbitrary))]
 pub struct PairToken(pub [u8; 16]);
+
+impl PartialEq for PairToken {
+    // Constant time, so the host's token check leaks no prefix length through timing.
+    fn eq(&self, other: &Self) -> bool {
+        self.0
+            .iter()
+            .zip(&other.0)
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+    }
+}
 
 impl core::fmt::Debug for PairToken {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -646,6 +664,38 @@ mod tests {
         let mut canonical = Vec::new();
         encode_framed(&msg, &mut canonical).unwrap();
         assert_eq!(canonical, [4, 0, 0, 0, 0, 0, 84, 0]);
+    }
+
+    /// Structs are frozen within a major: these bytes change only with a new major.
+    #[test]
+    fn configure_bytes_are_frozen() {
+        let msg = ControlMessage::Configure(Configure {
+            profile: Profile::HevcMain,
+            width: 2960,
+            height: 1848,
+            refresh_mhz: 120_000,
+            bitrate_kbps: 50_000,
+        });
+        let mut buf = Vec::new();
+        encode_framed(&msg, &mut buf).unwrap();
+        assert_eq!(
+            buf,
+            [
+                12, 0, 0, 0, 2, 3, 0x90, 0x17, 0xB8, 0x0E, 0xC0, 0xA9, 0x07, 0xD0, 0x86, 0x03
+            ]
+        );
+    }
+
+    #[test]
+    fn pair_token_equality() {
+        let a = PairToken([7; 16]);
+        let mut b = [7; 16];
+        assert_eq!(a, PairToken(b));
+        b[15] = 8;
+        assert_ne!(a, PairToken(b));
+        b = [7; 16];
+        b[0] = 0;
+        assert_ne!(a, PairToken(b));
     }
 
     #[test]

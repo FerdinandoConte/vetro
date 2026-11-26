@@ -8,6 +8,8 @@ members = [
     "crates/vetro-client",
 ]
 # apps/tray (Tauri 2) joins the workspace in M1-12.
+# The cargo-fuzz crate needs nightly, so it is its own workspace.
+exclude = ["crates/vetro-protocol/fuzz"]
 
 [workspace.package]
 version = "0.0.0"

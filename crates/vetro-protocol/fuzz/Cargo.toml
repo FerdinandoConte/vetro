@@ -1,0 +1,24 @@
+[package]
+name = "vetro-protocol-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Vetro contributors"]
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+vetro-protocol = { path = ".." }
+
+# Not part of the main workspace: cargo-fuzz needs nightly.
+[workspace]
+
+[[bin]]
+name = "protocol"
+path = "fuzz_targets/protocol.rs"
+test = false
+doc = false
+bench = false

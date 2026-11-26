@@ -11,7 +11,7 @@ Thanks for helping. Vetro is dual-licensed under MIT OR Apache-2.0; by contribut
 ## Setup
 - Rust stable (the `rust-toolchain.toml` picks it up). On Windows: MSVC target with Visual Studio 2022 Build Tools (C++ workload).
 - Android: JDK 17, Android SDK, NDK 28 and `cargo-ndk` (ARCHITECTURE section 14).
-- The Gradle wrapper is not committed yet (added in M1-6); until then use a locally installed Gradle 8.11.1 or newer in `android/`.
+- The Gradle wrapper is not committed yet (added in M1-6); until then use a locally installed Gradle 9.6.0 (the version AGP 9.5 requires) in `android/`.
 - FFmpeg (LGPL shared build): `tools/fetch-ffmpeg.ps1`.
 
 ## Pull requests

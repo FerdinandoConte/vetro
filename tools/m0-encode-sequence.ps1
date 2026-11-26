@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-  M0-5 unattended benchmark sequence (~52 min): short encode runs, R10 render-rate runs and the 30-min soak.
+  M0-5 unattended benchmark sequence (~67 min, -Only for a subset): short encode runs, R10 render-rate runs,
+  the 30-min soak and 3-min fallback-mode runs (GPU-scaled 1480x924 and 1920x1200 @120, native @60, preset veryfast).
 
 .DESCRIPTION
   Refuses to start unless tools/idle-guard.ps1 says bench_ok (owner idle >= 10 min, AC power, CPU < 20 %), and
@@ -9,7 +10,9 @@
 
   Display layout (no administrator rights; the APIs behind Win+P and Settings > Display): saves the active layout
   (QueryDisplayConfig), extends the desktop onto the VDD if it is off, sets it to 2960x1848 @120, makes it primary
-  for the render-vdd-primary step only, and puts the saved layout back at the end, also on failure or Ctrl+C.
+  for the render-vdd-primary step only (SetDisplayConfig source positions: the source at (0,0) is primary), and puts
+  the saved layout back at the end, also on failure or Ctrl+C. A step that fails is recorded and the next one runs.
+  Precondition besides bench_ok: no screen saver or display sleep (a screen saver stops Desktop Duplication).
   Must run in the owner's interactive session: a sandboxed shell gets access denied and the script refuses.
 
   Exit codes: 0 every run valid; 1 finished but a run was noisy, failed or captured the wrong size; 2 refused to
@@ -20,11 +23,15 @@
   powershell -NoProfile -ExecutionPolicy Bypass -File tools\m0-encode-sequence.ps1 -DryRun
 .EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File tools\m0-encode-sequence.ps1
+.EXAMPLE
+  powershell -NoProfile -ExecutionPolicy Bypass -File tools\m0-encode-sequence.ps1 -Prefix m0-20261126-0102 -Only render-vdd-primary,soak-nv12-30min
 #>
 [CmdletBinding()]
 param(
     [switch]$DryRun,
-    [string]$Prefix = "m0-$(Get-Date -Format yyyyMMdd-HHmm)"
+    [string]$Prefix = "m0-$(Get-Date -Format yyyyMMdd-HHmm)",
+    # Run only these steps (comma-separated names). With an existing -Prefix, results of other steps are kept.
+    [string[]]$Only = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -33,13 +40,26 @@ $IdleGuard = Join-Path $PSScriptRoot 'idle-guard.ps1'
 $OutDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'bench\raw\m0-encode'
 $W = 2960; $H = 1848; $Hz = 120
 
+# size = expected encoded (encode mode) or captured (render mode) size in the run's summary.
 $Steps = @(
     @{ name = 'enc-bgra-120';         vddPrimary = $false; cool = 30;  seconds = 300;  args = @('-Mode', 'encode', '-PixFmt', 'bgra', '-Page') }
     @{ name = 'enc-nv12-120';         vddPrimary = $false; cool = 30;  seconds = 300;  args = @('-Mode', 'encode', '-PixFmt', 'nv12', '-Page') }
     @{ name = 'render-panel-primary'; vddPrimary = $false; cool = 30;  seconds = 120;  args = @('-Mode', 'render', '-Page') }
     @{ name = 'render-vdd-primary';   vddPrimary = $true;  cool = 30;  seconds = 120;  args = @('-Mode', 'render', '-Page') }
-    @{ name = 'soak-bgra-30min';      vddPrimary = $false; cool = 120; seconds = 1800; args = @('-Mode', 'encode', '-PixFmt', 'bgra', '-Page') }
+    # nv12 is the faster input path (enc-nv12-120 vs enc-bgra-120), so it is the one the soak must hold.
+    @{ name = 'soak-nv12-30min';      vddPrimary = $false; cool = 120; seconds = 1800; args = @('-Mode', 'encode', '-PixFmt', 'nv12', '-Page') }
+    # Fallback candidates for M0-8, all from the native 2960x1848 @120 capture (no new VDD mode).
+    @{ name = 'fb-nv12-1480x924-120';  vddPrimary = $false; cool = 120; seconds = 180; size = '1480x924';  args = @('-Mode', 'encode', '-PixFmt', 'nv12', '-Scale', '1480x924', '-Page') }
+    @{ name = 'fb-nv12-1920x1200-120'; vddPrimary = $false; cool = 30;  seconds = 180; size = '1920x1200'; args = @('-Mode', 'encode', '-PixFmt', 'nv12', '-Scale', '1920x1200', '-Page') }
+    @{ name = 'fb-nv12-2960x1848-60';  vddPrimary = $false; cool = 30;  seconds = 180; args = @('-Mode', 'encode', '-PixFmt', 'nv12', '-Fps', '60', '-Page') }
+    @{ name = 'fb-nv12-120-veryfast';  vddPrimary = $false; cool = 30;  seconds = 180; args = @('-Mode', 'encode', '-PixFmt', 'nv12', '-Preset', 'veryfast', '-Page') }
 )
+if ($Only) {
+    $Only = @($Only -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })  # -File passes "a,b" as one string
+    $unknown = @($Only | Where-Object { $_ -notin $Steps.name })
+    if ($unknown) { Write-Host "Unknown step(s): $($unknown -join ', '). Steps: $($Steps.name -join ', ')"; exit 2 }
+    $Steps = @($Steps | Where-Object { $_.name -in $Only })
+}
 
 if (-not ('VetroDisplay' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -119,6 +139,26 @@ public static class VetroDisplay {
         return SetDisplayConfig(l.Np, l.P, l.Nm, l.M, 0x20u | (validate ? 0x40u : 0x80u | 0x200u | 0x400u)); // USE_SUPPLIED_DISPLAY_CONFIG
     }
     public static int Extend(bool validate) { return SetDisplayConfig(0, null, 0, null, 0x4u | (validate ? 0x40u : 0x80u)); } // TOPOLOGY_EXTEND
+
+    // Places the two desktop sources side by side; the primary is the source at (0,0) (CCD has no primary flag).
+    // The VDD source is the one of size vw x vh. Source mode: infoType@0 (1 = source), width@16, height@20, x@28, y@32.
+    // shortcut: identifies the VDD by size, so it needs a panel of another size (true on the reference laptop).
+    public static int Arrange(int vw, int vh, bool vddPrimary) {
+        var l = Save();
+        int v = -1, p = -1;
+        for (int o = 0; o < l.Nm * 64; o += 64) {
+            if (BitConverter.ToUInt32(l.M, o) != 1) continue;
+            bool isVdd = BitConverter.ToInt32(l.M, o + 16) == vw && BitConverter.ToInt32(l.M, o + 20) == vh;
+            if (isVdd) { if (v >= 0) throw new Exception("two sources of the VDD size"); v = o; }
+            else { if (p >= 0) throw new Exception("more than one non-VDD source"); p = o; }
+        }
+        if (v < 0 || p < 0) throw new Exception("VDD or panel source not found");
+        int pw = BitConverter.ToInt32(l.M, p + 16);
+        Put(l.M, v + 28, vddPrimary ? 0 : pw); Put(l.M, v + 32, 0);
+        Put(l.M, p + 28, vddPrimary ? -pw : 0); Put(l.M, p + 32, 0);
+        return Restore(l, false);
+    }
+    static void Put(byte[] b, int o, int x) { BitConverter.GetBytes(x).CopyTo(b, o); }
 }
 '@
 }
@@ -134,17 +174,16 @@ function Set-Layout([bool]$VddPrimary) {
         $e = [VetroDisplay]::Extend($false); if ($e -ne 0) { throw "extend failed (Win32 error $e)" }
         Start-Sleep -Seconds 3
     }
-    $snap = [VetroDisplay]::Snapshot()
-    $vdd = Get-Vdd $snap
-    $panel = @($snap | Where-Object { $_.Attached -and $_.Name -ne $vdd.Name })[0]
-    if (-not $vdd.Attached -or -not $panel) { throw 'VDD and panel are not both on the desktop after extend' }
-    if ($VddPrimary) { $px = 0 - $panel.W; $vx = 0 } else { $px = 0; $vx = $panel.W }
-    $codes = @(
-        [VetroDisplay]::Set($panel.Name, $panel.W, $panel.H, $panel.Hz, $px, 0, -not $VddPrimary)
-        [VetroDisplay]::Set($vdd.Name, $W, $H, $Hz, $vx, 0, $VddPrimary)
-        [VetroDisplay]::Commit()
-    )
-    if ($codes | Where-Object { $_ -ne 0 }) { throw "display change failed (vddPrimary=$VddPrimary, DISP_CHANGE codes $($codes -join ','))" }
+    $vdd = Get-Vdd ([VetroDisplay]::Snapshot())
+    if (-not $vdd.Attached) { throw 'VDD is not on the desktop after extend' }
+    if ($vdd.W -ne $W -or $vdd.H -ne $H -or $vdd.Hz -ne $Hz) {
+        # Mode only, in place. Primary goes through CCD below: CDS_SET_PRIMARY on the VDD returned DISP_CHANGE_FAILED (run m0-20261126-0102).
+        $codes = @([VetroDisplay]::Set($vdd.Name, $W, $H, $Hz, $vdd.X, $vdd.Y, $false), [VetroDisplay]::Commit())
+        if ($codes | Where-Object { $_ -ne 0 }) { throw "VDD mode change failed (DISP_CHANGE codes $($codes -join ','))" }
+        Start-Sleep -Seconds 3
+    }
+    $e = [VetroDisplay]::Arrange($W, $H, $VddPrimary)
+    if ($e -ne 0) { throw "SetDisplayConfig arrange failed (vddPrimary=$VddPrimary, Win32 error $e)" }
     Start-Sleep -Seconds 5  # let DWM and DXGI settle before ddagrab enumerates outputs
     $v = Get-Vdd ([VetroDisplay]::Snapshot())
     if ($v.W -ne $W -or $v.H -ne $H -or $v.Hz -ne $Hz -or $v.Primary -ne $VddPrimary) {
@@ -200,32 +239,40 @@ if ($access -ne 0 -or $extendOk -ne 0) { Write-Host 'Refusing to start: no displ
 if (-not $guard.policy.bench_ok) { Write-Host 'Refusing to start: idle-guard bench_ok is false (needs owner idle >= 10 min, AC power, CPU < 20 %).'; exit 2 }
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-$results = @()
+$seqJson = Join-Path $OutDir "$Prefix-sequence.json"
+# Keep earlier results of this prefix for the steps not rerun now.
+$results = @(if (Test-Path $seqJson) { Get-Content $seqJson -Raw | ConvertFrom-Json | Where-Object { $_.step -notin $Steps.name } })
 $exitCode = 0
 try {
     $layout = $null
     foreach ($s in $Steps) {
         Start-Sleep -Seconds $s.cool
         if (-not (Wait-BenchOk)) { $exitCode = 3; break }
-        if ($layout -ne $s.vddPrimary) { Set-Layout $s.vddPrimary; $layout = $s.vddPrimary; $idx = Find-VddOutput }
         $label = "$Prefix-$($s.name)"
-        Write-Host "$(Get-Date -Format HH:mm:ss) $label on output $idx"
-        & powershell -NoProfile -ExecutionPolicy Bypass -File $Bench -Label $label -Seconds $s.seconds -OutputIdx $idx @($s.args)
-        $benchExit = $LASTEXITCODE
         $json = Join-Path $OutDir "$label.json"
+        Remove-Item $json -ErrorAction SilentlyContinue  # a failed run must not pick up an older summary
+        $err = $null
+        try {
+            # A failing step (layout or bench) is recorded and the sequence goes on with the next one.
+            if ($layout -ne $s.vddPrimary) { $layout = $null; Set-Layout $s.vddPrimary; $layout = $s.vddPrimary; $idx = Find-VddOutput }
+            Write-Host "$(Get-Date -Format HH:mm:ss) $label on output $idx"
+            & powershell -NoProfile -ExecutionPolicy Bypass -File $Bench -Label $label -Seconds $s.seconds -OutputIdx $idx @($s.args)
+            if ($LASTEXITCODE -ne 0) { $err = "encode-bench exit $LASTEXITCODE" }
+        } catch { $err = "$_"; Write-Host "Step $($s.name) failed: $err" }
         $r = if (Test-Path $json) { Get-Content $json -Raw | ConvertFrom-Json } else { $null }
-        $ok = $benchExit -eq 0 -and $r -and $r.ffmpeg_exit -eq 0 -and -not $r.noisy -and $r.captured_size -eq "${W}x${H}"
+        $size = if ($s.size) { $s.size } else { "${W}x${H}" }
+        $ok = -not $err -and $r -and $r.ffmpeg_exit -eq 0 -and -not $r.noisy -and $r.captured_size -eq $size
         if (-not $ok) { $exitCode = 1 }
-        $results += [ordered]@{ step = $s.name; label = $label; valid = [bool]$ok; noisy = $r.noisy; ffmpeg_exit = $r.ffmpeg_exit; captured_size = $r.captured_size
-            fps_p50 = $r.fps_per_second_after_warmup.p50; encode_p50_ms = $r.encode_ms.p50; encode_p99_ms = $r.encode_ms.p99 }
+        $results += [pscustomobject][ordered]@{ step = $s.name; label = $label; valid = [bool]$ok; error = $err; noisy = $r.noisy; ffmpeg_exit = $r.ffmpeg_exit
+            captured_size = $r.captured_size; fps_p50 = $r.fps_per_second_after_warmup.p50; encode_p50_ms = $r.encode_ms.p50; encode_p99_ms = $r.encode_ms.p99 }
     }
 } catch {
     Write-Host "Error: $_"
     $exitCode = 4
 } finally {
     Write-Host "Display layout restored (SetDisplayConfig $([VetroDisplay]::Restore($saved, $false)), 0 = OK)."
-    $results | ConvertTo-Json -Depth 3 | Set-Content -Path (Join-Path $OutDir "$Prefix-sequence.json") -Encoding UTF8
-    $results | ForEach-Object { [pscustomobject]$_ } | Format-Table -AutoSize | Out-String | Write-Host
+    ConvertTo-Json -InputObject @($results) -Depth 3 | Set-Content -Path $seqJson -Encoding UTF8
+    $results | Format-Table -AutoSize | Out-String | Write-Host
     Write-Host "Sequence exit code $exitCode"
 }
 exit $exitCode

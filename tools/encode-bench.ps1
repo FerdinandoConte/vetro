@@ -32,6 +32,10 @@ param(
     [int]$OutputIdx = 1,
     # bgra: the encoder converts BGRA->NV12 itself; nv12: vpp_qsv converts first.
     [ValidateSet('bgra', 'nv12')][string]$PixFmt = 'bgra',
+    # Encoded size, e.g. 1480x924: vpp_qsv scales the captured frame on the GPU. Empty = captured size.
+    [ValidatePattern('^(\d{3,5}x\d{3,5})?$')][string]$Scale = '',
+    # hevc_qsv preset (veryfast = TargetUsage 7). Empty = encoder default (TargetUsage 4).
+    [ValidateSet('', 'veryfast', 'faster', 'fast', 'medium')][string]$Preset = '',
     [int]$BitrateMbps = 80,
     [switch]$Page,
     [string]$OutDir = '',  # default bench\raw\m0-encode, set below: $PSScriptRoot is empty in param defaults on PS 5.1
@@ -157,10 +161,15 @@ $log = Join-Path $LogDir "$Label.ffmpeg.log"
 $progress = Join-Path $LogDir "$Label.progress.txt"
 if ($Mode -eq 'encode') {
     $chain = "ddagrab=output_idx=${OutputIdx}:framerate=${Fps}:draw_mouse=0,hwmap=derive_device=qsv,format=qsv"
-    if ($PixFmt -eq 'nv12') { $chain += ',vpp_qsv=format=nv12' }
+    $vpp = @()
+    if ($PixFmt -eq 'nv12') { $vpp += 'format=nv12' }
+    if ($Scale) { $sw, $sh = $Scale -split 'x'; $vpp += "w=${sw}:h=${sh}" }
+    if ($vpp) { $chain += ',vpp_qsv=' + ($vpp -join ':') }
     $vbvBits = [int]($BitrateMbps * 1e6 / $Fps)
-    $ffArgs = @('-hide_banner', '-nostdin', '-benchmark_all', '-stats_period', '1', '-progress', $progress,
-        '-filter_complex', $chain, '-c:v', 'hevc_qsv', '-profile:v', 'main', '-async_depth', '1', '-low_power', '1',
+    $presetArgs = if ($Preset) { @('-preset', $Preset) } else { @() }
+    # -v verbose: hevc_qsv logs its effective parameters once (VDENC, TargetUsage); no per-frame lines.
+    $ffArgs = @('-hide_banner', '-nostdin', '-v', 'verbose', '-benchmark_all', '-stats_period', '1', '-progress', $progress,
+        '-filter_complex', $chain, '-c:v', 'hevc_qsv', '-profile:v', 'main') + $presetArgs + @('-async_depth', '1', '-low_power', '1',
         '-bf', '0', '-low_delay_brc', '1', '-b:v', "${BitrateMbps}M", '-maxrate', "${BitrateMbps}M",
         '-bufsize', "$vbvBits", '-g', '1000000', '-t', "$Seconds", '-f', 'null', '-')
 } else {
@@ -214,8 +223,13 @@ $noisy = -not ($guardStart.policy.bench_ok -and $stayedIdle)
 
 $summary = [ordered]@{
     label = $Label; mode = $Mode; started = $guardStart.checked_at; seconds = $Seconds
-    settings = [ordered]@{ fps = $Fps; output_idx = $OutputIdx; input = $PixFmt; bitrate_mbps = $BitrateMbps; page = [bool]$Page }
+    settings = [ordered]@{ fps = $Fps; output_idx = $OutputIdx; input = $PixFmt; scale = $Scale; preset = $Preset; bitrate_mbps = $BitrateMbps; page = [bool]$Page }
     ffmpeg_exit = $exit
+    # What hevc_qsv really configured (verbose log); null in render mode.
+    encoder = [ordered]@{
+        vdenc        = (Select-String -Path $log -Pattern '\] VDENC: (\w+)' | Select-Object -First 1).Matches.Groups[1].Value
+        target_usage = (Select-String -Path $log -Pattern '\] TargetUsage: (\d+)' | Select-Object -First 1).Matches.Groups[1].Value
+    }
     captured_size = (Select-String -Path $log -Pattern 'Stream #0:0: Video: .*?(\d{3,5}x\d{3,5})' | Select-Object -First 1).Matches.Groups[1].Value
     noisy = $noisy; guard_start = $guardStart; idle_checks = $idleSamples.Count; stayed_idle_on_ac = [bool]$stayedIdle
     fps_per_second_after_warmup = $fpsStats

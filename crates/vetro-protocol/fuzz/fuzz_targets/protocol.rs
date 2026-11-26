@@ -10,12 +10,17 @@ use vetro_protocol::messages::{
 };
 use vetro_protocol::{MAX_FRAGMENTS, PushOutcome, Reassembler, ReassemblerConfig};
 
-/// Whatever decodes must re-encode to the exact same bytes.
-fn stream<M: StreamMessage>(data: &[u8]) {
-    if let Ok(Some((msg, used))) = decode_framed::<M>(data) {
+/// Whatever decodes must re-encode, and the re-encoding must decode to the same message.
+/// (Not the same bytes: postcard accepts overlong varints, which carry the same value.)
+fn stream<M: StreamMessage + PartialEq + core::fmt::Debug>(data: &[u8]) {
+    if let Ok(Some((msg, _))) = decode_framed::<M>(data) {
         let mut again = Vec::new();
         encode_framed(&msg, &mut again).expect("a decoded message re-encodes");
-        assert_eq!(again.as_slice(), &data[..used]);
+        let (back, used) = decode_framed::<M>(&again)
+            .expect("a re-encoded message decodes")
+            .expect("a re-encoded message is complete");
+        assert_eq!(back, msg);
+        assert_eq!(used, again.len());
     }
 }
 

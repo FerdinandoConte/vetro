@@ -625,6 +625,29 @@ mod tests {
         assert_eq!(buf, expected);
     }
 
+    /// Found by the fuzzer: postcard accepts an overlong varint (`[0xD4, 0x00]` = 84). The value
+    /// is the same, so this is accepted; re-encoding gives the canonical form.
+    #[test]
+    fn overlong_varint_decodes_to_the_same_value() {
+        let (msg, used) = decode_framed::<ControlMessage>(&[5, 0, 0, 0, 0, 0, 212, 0, 0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(used, 9);
+        assert_eq!(
+            msg,
+            ControlMessage::Hello(Hello {
+                version: Version {
+                    major: 0,
+                    minor: 84
+                },
+                pair_token: None,
+            })
+        );
+        let mut canonical = Vec::new();
+        encode_framed(&msg, &mut canonical).unwrap();
+        assert_eq!(canonical, [4, 0, 0, 0, 0, 0, 84, 0]);
+    }
+
     #[test]
     fn pair_token_is_never_printed() {
         let dbg = format!("{:?}", PairToken([0x42; 16]));
@@ -721,14 +744,12 @@ mod tests {
         #[test]
         fn telemetry_roundtrips(msg: TelemetryMessage) { roundtrip(&msg); }
 
-        /// Arbitrary bytes never panic, and whatever decodes re-encodes to the same frame.
+        /// Arbitrary bytes never panic, and whatever decodes re-encodes to the same message.
         #[test]
         fn arbitrary_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
             fn check<M: StreamMessage + PartialEq + core::fmt::Debug>(bytes: &[u8]) {
-                if let Ok(Some((msg, used))) = decode_framed::<M>(bytes) {
-                    let mut again = Vec::new();
-                    encode_framed(&msg, &mut again).unwrap();
-                    assert_eq!(again.as_slice(), &bytes[..used]);
+                if let Ok(Some((msg, _))) = decode_framed::<M>(bytes) {
+                    roundtrip(&msg);
                 }
             }
             check::<ControlMessage>(&bytes);

@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/vetro-protocol",
+    "crates/vetro-transport",
+    "crates/vetro-encode",
+    "crates/vetro-engine",
+    "crates/vetro-client",
+]
+# apps/tray (Tauri 2) joins the workspace in M1-12.
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["Vetro contributors"]
+repository = "https://github.com/FerdinandoConte/vetro"
+publish = false

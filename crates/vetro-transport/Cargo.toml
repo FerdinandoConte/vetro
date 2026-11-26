@@ -1,0 +1,10 @@
+[package]
+name = "vetro-transport"
+description = "Vetro QUIC transport: pinned mutual TLS, pairing, congestion control, socket adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true

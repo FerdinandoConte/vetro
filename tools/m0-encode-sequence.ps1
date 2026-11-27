@@ -1,7 +1,8 @@
 <#
 .SYNOPSIS
-  M0-5 unattended benchmark sequence (~67 min, -Only for a subset): short encode runs, R10 render-rate runs,
-  the 30-min soak and 3-min fallback-mode runs (GPU-scaled 1480x924 and 1920x1200 @120, native @60, preset veryfast).
+  M0-5 unattended benchmark sequence (~1 h 45 min in full, -Only for a subset; -DryRun prints the plan): short
+  encode runs, R10 render-rate runs, 30-min soaks at 120 and at 60 fps, and 3-min fallback-mode runs
+  (GPU-scaled 1480x924 and 1920x1200 @120, native @60, preset veryfast).
 
 .DESCRIPTION
   Refuses to start unless tools/idle-guard.ps1 says bench_ok (owner idle >= 10 min, AC power, CPU < 20 %), and
@@ -17,7 +18,8 @@
 
   Exit codes: 0 every run valid; 1 finished but a run was noisy, failed or captured the wrong size; 2 refused to
   start (not bench_ok, VDD or its 120 Hz mode missing, no display access); 3 stopped early because the machine
-  stopped being idle/on AC; 4 unexpected error.
+  stopped being idle/on AC; 4 unexpected error; 6 the saved display layout could not be restored (recovery: Win+P,
+  "PC screen only"). A run also counts as failed when encode-bench flags page_render_suspect (timer page not drawing).
 
 .EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File tools\m0-encode-sequence.ps1 -DryRun
@@ -48,6 +50,8 @@ $Steps = @(
     @{ name = 'render-vdd-primary';   vddPrimary = $true;  cool = 30;  seconds = 120;  args = @('-Mode', 'render', '-Page') }
     # nv12 is the faster input path (enc-nv12-120 vs enc-bgra-120), so it is the one the soak must hold.
     @{ name = 'soak-nv12-30min';      vddPrimary = $false; cool = 120; seconds = 1800; args = @('-Mode', 'encode', '-PixFmt', 'nv12', '-Page') }
+    # The mode recommended for M1 (bench/m0-encode.md), soaked on its own after a 5-min cool-down.
+    @{ name = 'soak-nv12-60-30min';   vddPrimary = $false; cool = 300; seconds = 1800; args = @('-Mode', 'encode', '-PixFmt', 'nv12', '-Fps', '60', '-Page') }
     # Fallback candidates for M0-8, all from the native 2960x1848 @120 capture (no new VDD mode).
     @{ name = 'fb-nv12-1480x924-120';  vddPrimary = $false; cool = 120; seconds = 180; size = '1480x924';  args = @('-Mode', 'encode', '-PixFmt', 'nv12', '-Scale', '1480x924', '-Page') }
     @{ name = 'fb-nv12-1920x1200-120'; vddPrimary = $false; cool = 30;  seconds = 180; size = '1920x1200'; args = @('-Mode', 'encode', '-PixFmt', 'nv12', '-Scale', '1920x1200', '-Page') }
@@ -111,13 +115,12 @@ public static class VetroDisplay {
         return r;
     }
 
-    // Queued until Commit(): mode and position, plus primary flag.
-    public static int Set(string dev, int w, int h, int hz, int x, int y, bool primary) {
+    // Mode at a position, queued until Commit(). Primary is set through Arrange (CDS_SET_PRIMARY failed on the VDD).
+    public static int Set(string dev, int w, int h, int hz, int x, int y) {
         var dm = NewMode();
         dm.dmPelsWidth = w; dm.dmPelsHeight = h; dm.dmDisplayFrequency = hz; dm.dmPositionX = x; dm.dmPositionY = y;
         dm.dmFields = 0x20 | 0x80000 | 0x100000 | 0x400000;  // POSITION | PELSWIDTH | PELSHEIGHT | DISPLAYFREQUENCY
-        uint f = 0x1u | 0x10000000u | (primary ? 0x10u : 0u); // CDS_UPDATEREGISTRY | CDS_NORESET | CDS_SET_PRIMARY
-        return ChangeDisplaySettingsExW(dev, ref dm, IntPtr.Zero, f, IntPtr.Zero);
+        return ChangeDisplaySettingsExW(dev, ref dm, IntPtr.Zero, 0x1u | 0x10000000u, IntPtr.Zero); // CDS_UPDATEREGISTRY | CDS_NORESET
     }
     public static int Commit() { return ChangeDisplaySettingsExW(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero); }
 
@@ -178,7 +181,7 @@ function Set-Layout([bool]$VddPrimary) {
     if (-not $vdd.Attached) { throw 'VDD is not on the desktop after extend' }
     if ($vdd.W -ne $W -or $vdd.H -ne $H -or $vdd.Hz -ne $Hz) {
         # Mode only, in place. Primary goes through CCD below: CDS_SET_PRIMARY on the VDD returned DISP_CHANGE_FAILED (run m0-20261126-0102).
-        $codes = @([VetroDisplay]::Set($vdd.Name, $W, $H, $Hz, $vdd.X, $vdd.Y, $false), [VetroDisplay]::Commit())
+        $codes = @([VetroDisplay]::Set($vdd.Name, $W, $H, $Hz, $vdd.X, $vdd.Y), [VetroDisplay]::Commit())
         if ($codes | Where-Object { $_ -ne 0 }) { throw "VDD mode change failed (DISP_CHANGE codes $($codes -join ','))" }
         Start-Sleep -Seconds 3
     }
@@ -262,16 +265,22 @@ try {
         } catch { $err = "$_"; Write-Host "Step $($s.name) failed: $err" }
         $r = if (Test-Path $json) { Get-Content $json -Raw | ConvertFrom-Json } else { $null }
         $size = if ($s.size) { $s.size } else { "${W}x${H}" }
-        $ok = -not $err -and $r -and $r.ffmpeg_exit -eq 0 -and -not $r.noisy -and $r.captured_size -eq $size
+        $ok = -not $err -and $r -and $r.ffmpeg_exit -eq 0 -and -not $r.noisy -and -not $r.page_render_suspect -and $r.output_size -eq $size
         if (-not $ok) { $exitCode = 1 }
-        $results += [pscustomobject][ordered]@{ step = $s.name; label = $label; valid = [bool]$ok; error = $err; noisy = $r.noisy; ffmpeg_exit = $r.ffmpeg_exit
-            captured_size = $r.captured_size; fps_p50 = $r.fps_per_second_after_warmup.p50; encode_p50_ms = $r.encode_ms.p50; encode_p99_ms = $r.encode_ms.p99 }
+        $results += [pscustomobject][ordered]@{ step = $s.name; label = $label; valid = [bool]$ok; error = $err; noisy = $r.noisy
+            page_render_suspect = $r.page_render_suspect; ffmpeg_exit = $r.ffmpeg_exit; output_size = $r.output_size
+            fps_p50 = $r.fps_per_second_after_warmup.p50; encode_p50_ms = $r.encode_ms.p50; encode_p99_ms = $r.encode_ms.p99 }
     }
 } catch {
     Write-Host "Error: $_"
     $exitCode = 4
 } finally {
-    Write-Host "Display layout restored (SetDisplayConfig $([VetroDisplay]::Restore($saved, $false)), 0 = OK)."
+    $restore = [VetroDisplay]::Restore($saved, $false)
+    if ($restore -eq 0) { Write-Host 'Display layout restored.' }
+    else {
+        $exitCode = 6
+        Write-Host "DISPLAY LAYOUT NOT RESTORED (SetDisplayConfig error $restore). Recovery: press Win+P and choose 'Solo schermo PC' (PC screen only), or Settings > System > Display."
+    }
     ConvertTo-Json -InputObject @($results) -Depth 3 | Set-Content -Path $seqJson -Encoding UTF8
     $results | Format-Table -AutoSize | Out-String | Write-Host
     Write-Host "Sequence exit code $exitCode"

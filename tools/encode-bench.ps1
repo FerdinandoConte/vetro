@@ -35,7 +35,7 @@ param(
     # Encoded size, e.g. 1480x924: vpp_qsv scales the captured frame on the GPU. Empty = captured size.
     [ValidatePattern('^(\d{3,5}x\d{3,5})?$')][string]$Scale = '',
     # hevc_qsv preset (veryfast = TargetUsage 7). Empty = encoder default (TargetUsage 4).
-    [ValidateSet('', 'veryfast', 'faster', 'fast', 'medium')][string]$Preset = '',
+    [ValidateSet('', 'veryfast')][string]$Preset = '',
     [int]$BitrateMbps = 80,
     [switch]$Page,
     [string]$OutDir = '',  # default bench\raw\m0-encode, set below: $PSScriptRoot is empty in param defaults on PS 5.1
@@ -61,8 +61,19 @@ function Get-EncodeTimesMs([string[]]$Lines) {
         if ($l -match '^bench:\s+\d+ user\s+\d+ sys\s+(\d+) real encode_video') { [double]$Matches[1] }
     }
     $real = @($real)
-    $times = for ($i = 0; $i + 1 -lt $real.Count; $i += 2) { ($real[$i] + $real[$i + 1]) / 1000 }
-    [pscustomobject]@{ times = @($times); lines = $real.Count }
+    $send = @(for ($i = 0; $i + 1 -lt $real.Count; $i += 2) { $real[$i] / 1000 })
+    $recv = @(for ($i = 1; $i -lt $real.Count; $i += 2) { $real[$i] / 1000 })
+    $times = @(for ($i = 0; $i -lt $recv.Count; $i++) { $send[$i] + $recv[$i] })
+    [pscustomobject]@{ times = $times; send = $send; recv = $recv; lines = $real.Count }
+}
+
+function Get-Histogram([double[]]$Values) {
+    # Share of frames per 2 ms bin ("16" = 16-18 ms); the last bin "40" holds everything >= 40 ms.
+    $h = [ordered]@{}
+    if ($Values.Count -eq 0) { return $h }
+    $Values | Group-Object { [Math]::Min(40, 2 * [Math]::Floor($_ / 2)) } | Sort-Object { [double]$_.Name } |
+        ForEach-Object { $h[$_.Name] = [Math]::Round(100 * $_.Count / $Values.Count, 1) }
+    $h
 }
 
 function Get-Stats([double[]]$Values) {
@@ -92,10 +103,12 @@ if ($SelfTest) {
         'bench:        0 user        0 sys      999 real decode_video 0.0'
     )
     $r = Get-EncodeTimesMs $sample
-    if ($r.lines -ne 4 -or $r.times.Count -ne 2 -or $r.times[0] -ne 4.06 -or $r.times[1] -ne 5.04) {
+    if ($r.lines -ne 4 -or $r.times.Count -ne 2 -or $r.times[0] -ne 4.06 -or $r.times[1] -ne 5.04 -or
+        $r.send[1] -ne 5 -or $r.recv[0] -ne 0.06) {
         throw "pairing failed: $($r | ConvertTo-Json -Compress)"
     }
-    Write-Host 'SelfTest passed.'
+    $h = Get-Histogram @(1, 3, 3.5, 17, 55)
+    if ($h['0'] -ne 20 -or $h['2'] -ne 40 -or $h['16'] -ne 20 -or $h['40'] -ne 20) { throw "histogram failed: $($h | ConvertTo-Json -Compress)" }    Write-Host 'SelfTest passed.'
     exit 0
 }
 
@@ -124,7 +137,7 @@ $sampler = Start-Job -ArgumentList $IdleGuard -ScriptBlock {
         $s = [ordered]@{
             t          = (Get-Date).ToString('o')
             cpu_pct    = [int]$cpu.PercentProcessorTime
-            cpu_mhz    = [int]$cpu.ProcessorFrequency
+            # ProcessorFrequency is the static base clock; PercentProcessorPerformance is the real clock as % of base.
             cpu_perf_pct  = [int]$cpu.PercentProcessorPerformance
             cpu_limit_pct = [int]$cpu.PercentPerformanceLimit
             temp_c     = if ($tz.Count) { [Math]::Round(($tz | Measure-Object HighPrecisionTemperature -Maximum).Maximum / 10 - 273.15, 1) } else { $null }
@@ -177,12 +190,15 @@ if ($Mode -eq 'encode') {
         '-filter_complex', "ddagrab=output_idx=${OutputIdx}:framerate=240:dup_frames=0:draw_mouse=0",
         '-fps_mode', 'passthrough', '-t', "$Seconds", '-f', 'null', '-')
 }
-# ffmpeg writes everything to stderr; Start-Process keeps it out of PowerShell's error stream.
-$ff = Start-Process -FilePath $ffmpeg -ArgumentList $ffArgs -RedirectStandardError $log -NoNewWindow -PassThru -Wait
-$exit = $ff.ExitCode
-
-if ($edge) { Stop-Process -Id $edge.Id -ErrorAction SilentlyContinue }
-Stop-Job $sampler
+try {
+    # ffmpeg writes everything to stderr; Start-Process keeps it out of PowerShell's error stream.
+    $ff = Start-Process -FilePath $ffmpeg -ArgumentList $ffArgs -RedirectStandardError $log -NoNewWindow -PassThru -Wait
+    $exit = $ff.ExitCode
+} finally {
+    # Also on Ctrl+C: close the Edge window this run opened and stop the sampler.
+    if ($edge) { Stop-Process -Id $edge.Id -ErrorAction SilentlyContinue }
+    Stop-Job $sampler
+}
 $samples = @(Receive-Job $sampler | ForEach-Object { $_ | ConvertFrom-Json })
 Remove-Job $sampler -Force
 
@@ -198,14 +214,21 @@ if ($Mode -eq 'encode') {
     $skip = if ($frames.Count -gt $WarmupSeconds) { $frames[$WarmupSeconds - 1] } else { 0 }
     $times = @($r.times | Select-Object -Skip $skip)
     $enc = Get-Stats $times
-    $enc.frames_logged = $r.times.Count
-    $enc.frames_reported = if ($frames.Count) { $frames[-1] } else { 0 }
-    $enc.over_budget_5ms_pct = [Math]::Round(100 * @($times | Where-Object { $_ -gt 5 }).Count / [Math]::Max(1, $times.Count), 2)
-    $enc.over_frame_period_pct = [Math]::Round(100 * @($times | Where-Object { $_ -gt 1000 / $Fps }).Count / [Math]::Max(1, $times.Count), 2)
+    if ($enc) {  # null when ffmpeg failed before encoding anything
+        $enc.frames_logged = $r.times.Count
+        $enc.frames_reported = if ($frames.Count) { $frames[-1] } else { 0 }
+        $enc.over_budget_5ms_pct = [Math]::Round(100 * @($times | Where-Object { $_ -gt 5 }).Count / $times.Count, 2)
+        $enc.over_frame_period_pct = [Math]::Round(100 * @($times | Where-Object { $_ -gt 1000 / $Fps }).Count / $times.Count, 2)
+        # With async_depth=1 almost all of the time is in send_frame; the split shows it.
+        $enc.send_ms = Get-Stats @($r.send | Select-Object -Skip $skip)
+        $enc.receive_ms = Get-Stats @($r.recv | Select-Object -Skip $skip)
+        $enc.histogram_2ms_pct = Get-Histogram $times
+    }
     # Drift over a soak: encode p50/p99 and fps per minute.
     for ($m = 0; ($m + 1) * 60 -le $frames.Count; $m++) {
         $a = if ($m -eq 0) { 0 } else { $frames[$m * 60 - 1] }
         $b = $frames[($m + 1) * 60 - 1]
+        if ($b -le $a) { continue }  # no frame in that minute: $a..($b - 1) would count downwards
         $w = @($r.times[$a..($b - 1)])
         $st = Get-Stats $w
         $perMinute += [ordered]@{ minute = $m + 1; fps = [Math]::Round(($b - $a) / 60, 1); p50 = $st.p50; p99 = $st.p99 }
@@ -218,7 +241,13 @@ $gpuStats = [ordered]@{}
 foreach ($t in $gpuTypes) { $gpuStats[$t] = Get-Stats @($samples | ForEach-Object { $_.gpu.$t } | Where-Object { $null -ne $_ }) }
 
 $idleSamples = @($samples | Where-Object { $null -ne $_.idle_min })
-$stayedIdle = -not ($idleSamples | Where-Object { $_.idle_min -lt 10 -or -not $_.on_ac })
+# An idle check comes about every 40 s; a run without enough of them proves nothing about idleness.
+$idleChecksNeeded = [Math]::Max(1, [Math]::Floor($Seconds / 45))
+$stayedIdle = $idleSamples.Count -ge $idleChecksNeeded -and -not ($idleSamples | Where-Object { $_.idle_min -lt 10 -or -not $_.on_ac })
+# The timer page is the only big 3D user besides vpp_qsv; a near-idle 3D engine means the page did not render
+# (with nv12 input vpp_qsv keeps 3D busy too, so there it catches only a page that is also missing other load).
+$page3d = $gpuStats['3D']
+$pageSuspect = [bool]$Page -and (-not $page3d -or $page3d.p50 -lt 5)
 $noisy = -not ($guardStart.policy.bench_ok -and $stayedIdle)
 
 $summary = [ordered]@{
@@ -229,14 +258,18 @@ $summary = [ordered]@{
     encoder = if ($Mode -eq 'encode') { [ordered]@{
         vdenc        = @(Select-String -Path $log -Pattern '\] VDENC: (\w+)' | ForEach-Object { $_.Matches[0].Groups[1].Value })[0]
         target_usage = @(Select-String -Path $log -Pattern '\] TargetUsage: (\d+)' | ForEach-Object { $_.Matches[0].Groups[1].Value })[0]
+        low_delay_brc = @(Select-String -Path $log -Pattern '\] LowDelayBRC: (\w+)' | ForEach-Object { $_.Matches[0].Groups[1].Value })[0]
+        rate_control = @(Select-String -Path $log -Pattern 'RateControlMethod: (\w+)' | ForEach-Object { $_.Matches[0].Groups[1].Value })[0]
     } } else { $null }
-    captured_size = (Select-String -Path $log -Pattern 'Stream #0:0: Video: .*?(\d{3,5}x\d{3,5})' | Select-Object -First 1).Matches.Groups[1].Value
-    noisy = $noisy; guard_start = $guardStart; idle_checks = $idleSamples.Count; stayed_idle_on_ac = [bool]$stayedIdle
+    # Size of ffmpeg's output stream: the encoded size in encode mode (after -Scale), the captured size in render mode.
+    output_size = @(Select-String -Path $log -Pattern 'Stream #0:0: Video: .*?(\d{3,5}x\d{3,5})' | ForEach-Object { $_.Matches[0].Groups[1].Value })[0]
+    page_render_suspect = $pageSuspect
+    noisy = $noisy; guard_start = $guardStart; idle_checks = $idleSamples.Count; idle_checks_needed = $idleChecksNeeded; stayed_idle_on_ac = [bool]$stayedIdle
     idle_check_failures = @($idleSamples | Where-Object { $_.idle_min -lt 10 -or -not $_.on_ac } | ForEach-Object { "$($_.t) idle_min=$($_.idle_min) on_ac=$($_.on_ac)" })
     fps_per_second_after_warmup = $fpsStats
     encode_ms = $enc
     per_minute = $perMinute
-    cpu_pct = Get-SampleStats 'cpu_pct'; cpu_mhz = Get-SampleStats 'cpu_mhz'
+    cpu_pct = Get-SampleStats 'cpu_pct'
     cpu_perf_pct = Get-SampleStats 'cpu_perf_pct'; cpu_limit_pct = Get-SampleStats 'cpu_limit_pct'
     temp_c = Get-SampleStats 'temp_c'; passive_limit_pct = Get-SampleStats 'passive_limit_pct'
     throttle_reasons_seen = @($samples | ForEach-Object { $_.throttle } | Sort-Object -Unique)
@@ -244,4 +277,4 @@ $summary = [ordered]@{
 }
 $json = Join-Path $OutDir "$Label.json"
 $summary | ConvertTo-Json -Depth 6 | Set-Content -Path $json -Encoding UTF8
-Write-Host "Summary: $json (noisy=$noisy, ffmpeg exit $exit)"
+Write-Host "Summary: $json (noisy=$noisy, page_render_suspect=$pageSuspect, ffmpeg exit $exit)"

@@ -1,0 +1,17 @@
+# vetro-protocol does no I/O (ARCHITECTURE section 7, M1-2): `clippy -D warnings` rejects any use of these.
+disallowed-types = [
+    { path = "std::fs::File", reason = "vetro-protocol does no I/O" },
+    { path = "std::net::UdpSocket", reason = "vetro-protocol does no I/O" },
+    { path = "std::net::TcpStream", reason = "vetro-protocol does no I/O" },
+    { path = "std::net::TcpListener", reason = "vetro-protocol does no I/O" },
+    { path = "std::time::Instant", reason = "time comes from the caller as now_us" },
+    { path = "std::time::SystemTime", reason = "time comes from the caller as now_us" },
+]
+disallowed-methods = [
+    { path = "std::thread::spawn", reason = "vetro-protocol has no threads" },
+    { path = "std::thread::sleep", reason = "vetro-protocol never blocks" },
+    { path = "std::io::stdout", reason = "vetro-protocol does no I/O" },
+    { path = "std::io::stderr", reason = "vetro-protocol does no I/O" },
+    { path = "std::fs::read", reason = "vetro-protocol does no I/O" },
+    { path = "std::fs::write", reason = "vetro-protocol does no I/O" },
+]

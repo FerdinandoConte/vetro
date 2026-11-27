@@ -1,0 +1,173 @@
+﻿{
+    "label":  "m0-20261126-0102-fb-nv12-1480x924-120",
+    "mode":  "encode",
+    "started":  "2026-11-28T00:00:28.1368908+01:00",
+    "seconds":  180,
+    "settings":  {
+                     "fps":  120,
+                     "output_idx":  1,
+                     "input":  "nv12",
+                     "scale":  "1480x924",
+                     "preset":  "",
+                     "bitrate_mbps":  80,
+                     "page":  true
+                 },
+    "ffmpeg_exit":  0,
+    "encoder":  {
+                    "vdenc":  "ON",
+                    "target_usage":  "4"
+                },
+    "captured_size":  "1480x924",
+    "noisy":  false,
+    "guard_start":  {
+                        "checked_at":  "2026-11-28T00:00:28.1368908+01:00",
+                        "idle_minutes":  20.6,
+                        "on_ac":  true,
+                        "free_ram_gb":  6.73,
+                        "cpu_load_pct":  5,
+                        "policy":  {
+                                       "mode":  "idle",
+                                       "max_jobs":  16,
+                                       "priority":  "normal",
+                                       "pause":  false,
+                                       "bench_ok":  true
+                                   }
+                    },
+    "idle_checks":  5,
+    "stayed_idle_on_ac":  true,
+    "fps_per_second_after_warmup":  {
+                                        "n":  173,
+                                        "p50":  87,
+                                        "p95":  111,
+                                        "p99":  120,
+                                        "max":  121,
+                                        "mean":  88.28
+                                    },
+    "encode_ms":  {
+                      "n":  15348,
+                      "p50":  8.53,
+                      "p95":  17.13,
+                      "p99":  24.94,
+                      "max":  40.86,
+                      "mean":  9.92,
+                      "frames_logged":  15736,
+                      "frames_reported":  15736,
+                      "over_budget_5ms_pct":  99.14,
+                      "over_frame_period_pct":  53.39
+                  },
+    "per_minute":  [
+                       {
+                           "minute":  1,
+                           "fps":  94.4,
+                           "p50":  8.34,
+                           "p99":  22.63
+                       },
+                       {
+                           "minute":  2,
+                           "fps":  82.2,
+                           "p50":  8.86,
+                           "p99":  26.42
+                       }
+                   ],
+    "cpu_pct":  {
+                    "n":  66,
+                    "p50":  15,
+                    "p95":  41,
+                    "p99":  60,
+                    "max":  60,
+                    "mean":  16.94
+                },
+    "cpu_mhz":  {
+                    "n":  66,
+                    "p50":  1800,
+                    "p95":  1800,
+                    "p99":  1800,
+                    "max":  1800,
+                    "mean":  1800
+                },
+    "cpu_perf_pct":  {
+                         "n":  66,
+                         "p50":  143,
+                         "p95":  150,
+                         "p99":  150,
+                         "max":  150,
+                         "mean":  142.68
+                     },
+    "cpu_limit_pct":  {
+                          "n":  66,
+                          "p50":  85,
+                          "p95":  85,
+                          "p99":  85,
+                          "max":  85,
+                          "mean":  85
+                      },
+    "temp_c":  {
+                   "n":  66,
+                   "p50":  84.1,
+                   "p95":  87.1,
+                   "p99":  92.1,
+                   "max":  92.1,
+                   "mean":  84.33
+               },
+    "passive_limit_pct":  {
+                              "n":  66,
+                              "p50":  100,
+                              "p95":  100,
+                              "p99":  100,
+                              "max":  100,
+                              "mean":  100
+                          },
+    "throttle_reasons_seen":  [
+                                  0
+                              ],
+    "gpu_engine_util_pct":  {
+                                "3D":  {
+                                           "n":  66,
+                                           "p50":  61,
+                                           "p95":  69,
+                                           "p99":  71,
+                                           "max":  71,
+                                           "mean":  60.74
+                                       },
+                                "Copy":  {
+                                             "n":  66,
+                                             "p50":  0,
+                                             "p95":  0,
+                                             "p99":  0,
+                                             "max":  0,
+                                             "mean":  0
+                                         },
+                                "LegacyOverlay":  {
+                                                      "n":  66,
+                                                      "p50":  0,
+                                                      "p95":  0,
+                                                      "p99":  0,
+                                                      "max":  0,
+                                                      "mean":  0
+                                                  },
+                                "other":  {
+                                              "n":  66,
+                                              "p50":  0,
+                                              "p95":  0,
+                                              "p99":  0,
+                                              "max":  0,
+                                              "mean":  0
+                                          },
+                                "VideoDecode":  {
+                                                    "n":  66,
+                                                    "p50":  36,
+                                                    "p95":  48,
+                                                    "p99":  52,
+                                                    "max":  52,
+                                                    "mean":  36.21
+                                                },
+                                "VideoProcessing":  {
+                                                        "n":  66,
+                                                        "p50":  0,
+                                                        "p95":  0,
+                                                        "p99":  0,
+                                                        "max":  0,
+                                                        "mean":  0
+                                                    }
+                            }
+}

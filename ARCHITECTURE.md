@@ -242,7 +242,7 @@ Client: any Android 11+ device with a hardware H.264/HEVC decoder. AV1 needs e.g
 
 | # | Risk | Resolved in |
 |---|---|---|
-| R1 | Iris Xe may not sustain HEVC 2960×1848 @120 fps within the 5 ms encode budget, or may throttle in a 30-minute soak | M0 (FFmpeg `ddagrab` + `hevc_qsv` spike, Apollo baseline), M1 soak |
+| R1 | Iris Xe may not sustain HEVC 2960×1848 @120 fps within the 5 ms encode budget, or may throttle in a 30-minute soak | M0-5 ([bench/m0-encode.md](bench/m0-encode.md)): not sustained; best native 78 fps (preset veryfast), encode p50 ≥ 8 ms in every mode; 2960×1848 @60 held 60 fps at p50 10.8 ms in one 3-min run. Soaks (@120 and @60) re-run pending. Target mode decided in M0-8; M1 soak |
 | R2 | A Wi-Fi-only Tab S8 Ultra may not offer USB tethering at all | M0 (check on device) |
 | R3 | USB tethering can steal the PC's default route; fixing the interface metric may need admin rights | M1 |
 | R4 | AOA on Windows needs WinUSB bound to `18D1:2D00/2D01` and a way to send the AOA start requests | M0-7: does not work on a stock PC without developer options and a driver install ([ADR-0016](docs/adr/0016-aoa-on-windows.md), Proposed); M2 pre-spike |
@@ -251,4 +251,4 @@ Client: any Android 11+ device with a hardware H.264/HEVC decoder. AV1 needs e.g
 | R7 | Samsung adaptive refresh honouring `setFrameRate` at 120 Hz | M1 |
 | R8 | Gesture navigation stealing edge swipes | M1 (documented limitation) |
 | R9 | FFmpeg D3D11→QSV zero-copy latency and stability | M1 spike; fallback: native oneVPL backend behind the `Encoder` trait |
-| R10 | Content on a secondary 120 Hz virtual monitor may render at the primary panel's 60 Hz (seen with Edge in the M0 baseline), which would cap the stream and blind the §11 timer method | M0-5 check while VDD is installed, recorded in M0-8 |
+| R10 | Content on a secondary 120 Hz virtual monitor may render at the primary panel's 60 Hz (seen with Edge in the M0 baseline), which would cap the stream and blind the §11 timer method | M0-5: 60 Hz cap confirmed (VDD output composes at 61 fps while the 60 Hz panel is primary, valid run). Provisional: 121 fps when the VDD is primary (run not valid, re-run pending) ([bench/m0-encode.md](bench/m0-encode.md)); decision in M0-8 |

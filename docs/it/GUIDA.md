@@ -127,7 +127,8 @@ Di notte (alle 2) Vetro può provarsi da solo sul tablet vero e misurare la sua 
 1. il **tablet** è collegato al PC con il cavo e in carica;
 2. il **PC** è attaccato alla corrente e acceso;
 3. l'app **Claude** è aperta (anche ridotta a icona);
-4. non stai usando il PC da almeno 10 minuti.
+4. non stai usando il PC da almeno 10 minuti;
+5. il **salvaschermo** è disattivato (Impostazioni → Personalizzazione → Schermata di blocco → Salvaschermo: "Nessuno"). Con il salvaschermo acceso Windows smette di far vedere lo schermo ai programmi e la prova non parte.
 
 Lasciare il tablet collegato vuol dire "sì, puoi provare". Se non lo colleghi, la prova salta. Non cambia mai il codice: misura e basta.
 

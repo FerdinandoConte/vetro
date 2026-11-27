@@ -225,13 +225,14 @@ $summary = [ordered]@{
     label = $Label; mode = $Mode; started = $guardStart.checked_at; seconds = $Seconds
     settings = [ordered]@{ fps = $Fps; output_idx = $OutputIdx; input = $PixFmt; scale = $Scale; preset = $Preset; bitrate_mbps = $BitrateMbps; page = [bool]$Page }
     ffmpeg_exit = $exit
-    # What hevc_qsv really configured (verbose log); null in render mode.
-    encoder = [ordered]@{
-        vdenc        = (Select-String -Path $log -Pattern '\] VDENC: (\w+)' | Select-Object -First 1).Matches.Groups[1].Value
-        target_usage = (Select-String -Path $log -Pattern '\] TargetUsage: (\d+)' | Select-Object -First 1).Matches.Groups[1].Value
-    }
+    # What hevc_qsv really configured (verbose log); null in render mode (indexing a missing match threw there).
+    encoder = if ($Mode -eq 'encode') { [ordered]@{
+        vdenc        = @(Select-String -Path $log -Pattern '\] VDENC: (\w+)' | ForEach-Object { $_.Matches[0].Groups[1].Value })[0]
+        target_usage = @(Select-String -Path $log -Pattern '\] TargetUsage: (\d+)' | ForEach-Object { $_.Matches[0].Groups[1].Value })[0]
+    } } else { $null }
     captured_size = (Select-String -Path $log -Pattern 'Stream #0:0: Video: .*?(\d{3,5}x\d{3,5})' | Select-Object -First 1).Matches.Groups[1].Value
     noisy = $noisy; guard_start = $guardStart; idle_checks = $idleSamples.Count; stayed_idle_on_ac = [bool]$stayedIdle
+    idle_check_failures = @($idleSamples | Where-Object { $_.idle_min -lt 10 -or -not $_.on_ac } | ForEach-Object { "$($_.t) idle_min=$($_.idle_min) on_ac=$($_.on_ac)" })
     fps_per_second_after_warmup = $fpsStats
     encode_ms = $enc
     per_minute = $perMinute

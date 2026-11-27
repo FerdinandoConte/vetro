@@ -241,7 +241,8 @@ if (-not $guard.policy.bench_ok) { Write-Host 'Refusing to start: idle-guard ben
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $seqJson = Join-Path $OutDir "$Prefix-sequence.json"
 # Keep earlier results of this prefix for the steps not rerun now.
-$results = @(if (Test-Path $seqJson) { Get-Content $seqJson -Raw | ConvertFrom-Json | Where-Object { $_.step -notin $Steps.name } })
+# The parentheses matter: PS 5.1 ConvertFrom-Json emits a JSON array as one object, which Where-Object would keep whole.
+$results = @(if (Test-Path $seqJson) { (Get-Content $seqJson -Raw | ConvertFrom-Json) | Where-Object { $_.step -notin $Steps.name } })
 $exitCode = 0
 try {
     $layout = $null

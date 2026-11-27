@@ -1,0 +1,107 @@
+﻿[
+    {
+        "step":  "enc-bgra-120",
+        "label":  "m0-20261126-0102-enc-bgra-120",
+        "valid":  true,
+        "noisy":  false,
+        "ffmpeg_exit":  0,
+        "captured_size":  "2960x1848",
+        "fps_p50":  43,
+        "encode_p50_ms":  19.34,
+        "encode_p99_ms":  47.9
+    },
+    {
+        "step":  "enc-nv12-120",
+        "label":  "m0-20261126-0102-enc-nv12-120",
+        "valid":  true,
+        "noisy":  false,
+        "ffmpeg_exit":  0,
+        "captured_size":  "2960x1848",
+        "fps_p50":  63,
+        "encode_p50_ms":  16.31,
+        "encode_p99_ms":  23.07
+    },
+    {
+        "step":  "render-panel-primary",
+        "label":  "m0-20261126-0102-render-panel-primary",
+        "valid":  true,
+        "noisy":  false,
+        "ffmpeg_exit":  0,
+        "captured_size":  "2960x1848",
+        "fps_p50":  61,
+        "encode_p50_ms":  null,
+        "encode_p99_ms":  null
+    },
+    {
+        "step":  "render-vdd-primary",
+        "label":  "m0-20261126-0102-render-vdd-primary",
+        "valid":  false,
+        "error":  "encode-bench exit 1",
+        "noisy":  null,
+        "ffmpeg_exit":  null,
+        "captured_size":  null,
+        "fps_p50":  null,
+        "encode_p50_ms":  null,
+        "encode_p99_ms":  null
+    },
+    {
+        "step":  "soak-nv12-30min",
+        "label":  "m0-20261126-0102-soak-nv12-30min",
+        "valid":  false,
+        "error":  null,
+        "noisy":  true,
+        "ffmpeg_exit":  0,
+        "captured_size":  "2960x1848",
+        "fps_p50":  75,
+        "encode_p50_ms":  13.26,
+        "encode_p99_ms":  28.68
+    },
+    {
+        "step":  "fb-nv12-1480x924-120",
+        "label":  "m0-20261126-0102-fb-nv12-1480x924-120",
+        "valid":  true,
+        "error":  null,
+        "noisy":  false,
+        "ffmpeg_exit":  0,
+        "captured_size":  "1480x924",
+        "fps_p50":  87,
+        "encode_p50_ms":  8.53,
+        "encode_p99_ms":  24.94
+    },
+    {
+        "step":  "fb-nv12-1920x1200-120",
+        "label":  "m0-20261126-0102-fb-nv12-1920x1200-120",
+        "valid":  true,
+        "error":  null,
+        "noisy":  false,
+        "ffmpeg_exit":  0,
+        "captured_size":  "1920x1200",
+        "fps_p50":  89,
+        "encode_p50_ms":  8.79,
+        "encode_p99_ms":  24.15
+    },
+    {
+        "step":  "fb-nv12-2960x1848-60",
+        "label":  "m0-20261126-0102-fb-nv12-2960x1848-60",
+        "valid":  true,
+        "error":  null,
+        "noisy":  false,
+        "ffmpeg_exit":  0,
+        "captured_size":  "2960x1848",
+        "fps_p50":  60,
+        "encode_p50_ms":  10.84,
+        "encode_p99_ms":  21.71
+    },
+    {
+        "step":  "fb-nv12-120-veryfast",
+        "label":  "m0-20261126-0102-fb-nv12-120-veryfast",
+        "valid":  true,
+        "error":  null,
+        "noisy":  false,
+        "ffmpeg_exit":  0,
+        "captured_size":  "2960x1848",
+        "fps_p50":  78,
+        "encode_p50_ms":  9.04,
+        "encode_p99_ms":  20.75
+    }
+]

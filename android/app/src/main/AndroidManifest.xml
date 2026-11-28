@@ -1,13 +1,36 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <application android:label="Vetro">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <!-- For the mDNS browse of M1-13: the Wi-Fi chip drops multicast replies unless a MulticastLock is held. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+
+    <!-- allowBackup=false: identity.bin (the tablet's private key) and the paired hosts must not leave the device. -->
+    <application
+        android:allowBackup="false"
+        android:label="Vetro"
+        android:theme="@android:style/Theme.Material.NoActionBar">
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:launchMode="singleTop">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- vetro://pair?... only pre-fills the pairing field; the owner still taps Pair. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="vetro" android:host="pair" />
+            </intent-filter>
         </activity>
+        <activity
+            android:name=".StreamActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboardHidden|uiMode"
+            android:screenOrientation="sensorLandscape" />
     </application>
 </manifest>

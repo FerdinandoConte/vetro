@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod discovery;
 mod pump;
 pub mod source;
 pub mod telemetry;
@@ -112,15 +113,21 @@ impl Engine {
     }
 
     /// The pairing QR's content (ARCHITECTURE section 8), token as 32 lowercase hex digits.
-    /// shortcut: `a=` is the bound address; listing every interface address comes with the
-    /// tray QR (M1-12) and mDNS (M1-13).
+    /// `a=` is the `--bind` address, or for a wildcard bind the first suitable LAN IPv4
+    /// address ([`discovery::suitable`]); with none the call fails.
+    /// shortcut: one address; listing every interface address comes with the tray QR (M1-12).
     pub fn pair_uri(&self, token: &PairToken) -> Result<String, Error> {
         let addr = self.local_addr()?;
+        let ip = discovery::pair_ip(addr, &discovery::lan_ipv4s()).ok_or_else(|| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "no LAN IPv4 address for the pairing URI: join a network or pass --bind <LAN IP>:47800",
+            ))
+        })?;
         let t: String = token.0.iter().map(|b| format!("{b:02x}")).collect();
         Ok(format!(
-            "vetro://pair?fp={}&t={t}&a={}&p={}",
+            "vetro://pair?fp={}&t={t}&a={ip}&p={}",
             self.fingerprint,
-            addr.ip(),
             addr.port()
         ))
     }
@@ -128,6 +135,7 @@ impl Engine {
     /// Serves sessions until `shutdown` resolves, then closes the endpoint and flushes
     /// telemetry.
     pub async fn run(self, shutdown: impl Future<Output = ()>) -> Result<(), Error> {
+        let advertiser = self.advertise();
         let (tx, mut sessions) = mpsc::channel::<HostSession>(1);
         let host = self.host.clone();
         let acceptor = tokio::spawn(async move {
@@ -166,6 +174,11 @@ impl Engine {
         }
 
         acceptor.abort();
+        if let Some(a) = advertiser {
+            // Withdraw first, so no tablet is sent to an engine that is going away. The goodbye
+            // waits on a thread: not on an async worker.
+            let _ = tokio::task::spawn_blocking(move || drop(a)).await;
+        }
         self.host.close();
         let _ = tokio::time::timeout(CLOSE_WAIT, self.host.wait_idle()).await;
         let dropped = self.telemetry.dropped();
@@ -175,6 +188,30 @@ impl Engine {
         self.telemetry.finish()?;
         log(format_args!("stopped"));
         Ok(())
+    }
+
+    /// Publishes the service on the LAN addresses of the bound socket. Discovery is a
+    /// convenience (the tablet can always dial an address, section 6.2), so a failure is
+    /// logged and the engine serves anyway.
+    fn advertise(&self) -> Option<discovery::Advertiser> {
+        let bound = self.local_addr().ok()?;
+        let addrs = discovery::dial_addrs(bound, &discovery::lan_ipv4s());
+        if addrs.is_empty() {
+            log(format_args!(
+                "mDNS off: no suitable LAN IPv4 address for {bound}"
+            ));
+            return None;
+        }
+        match discovery::Advertiser::start(&addrs, bound.port(), self.fingerprint) {
+            Ok(a) => {
+                log(format_args!("advertising _vetro._udp on {addrs:?}"));
+                Some(a)
+            }
+            Err(e) => {
+                log(format_args!("mDNS off: {e}"));
+                None
+            }
+        }
     }
 
     async fn serve<F: Future<Output = ()>>(

@@ -235,7 +235,8 @@ mod tests {
         assert_eq!(got.info.frame_id, 0, "the unsent frame survives");
         assert!(mb.wait_empty(Duration::ZERO));
         // Refused and sent buffers go back to the pool, capacity intact.
-        assert_eq!(mb.buffer().as_ptr(), b_ptr);
+        let b_again = mb.buffer();
+        assert_eq!(b_again.as_ptr(), b_ptr);
         mb.recycle(got.data);
         let reused = mb.buffer();
         assert_eq!(reused.as_ptr(), a_ptr);

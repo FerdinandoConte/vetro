@@ -26,8 +26,10 @@ usage: vetro-engine --no-vdd [--test-pattern moving-bars|gpu-bars] [--bind <addr
   --bind <addr:port>        listening address (default 0.0.0.0:47800)
   --telemetry-out <file>    write one JSON line per sent frame (host clock, microseconds)
   --pair                    open a pairing window and print the pairing URI on stdout
-                            (what the tray's QR code will show, M1-12); needs --bind
-                            with the LAN address the tablet will dial";
+                            (what the tray's QR code will show, M1-12); the address in it is
+                            the --bind address, or the first LAN IPv4 address of this PC
+
+The engine announces itself on the LAN as _vetro._udp (mDNS) when it has a LAN IPv4 address.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestPattern {
@@ -96,13 +98,6 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Config>,
     }
     if !no_vdd {
         return Err("the virtual display arrives in M1-8; pass --no-vdd".into());
-    }
-    // The URI's `a=` must be an address the tablet can dial; listing interfaces is M1-13.
-    if cfg.pair && cfg.bind.ip().is_unspecified() {
-        return Err(format!(
-            "--pair needs the address the tablet will dial: pass --bind <LAN IP>:{}",
-            cfg.bind.port()
-        ));
     }
     Ok(Some(cfg))
 }
@@ -179,12 +174,16 @@ mod tests {
             "--no-vdd --telemetry-out",
             "--no-vdd --fast",
             "--no-vdd extra",
-            "--no-vdd --pair",
-            "--no-vdd --pair --bind 0.0.0.0:47800",
-            "--no-vdd --pair --bind [::]:47800",
         ] {
             assert!(parse(args(bad)).is_err(), "{bad:?} must be rejected");
         }
+    }
+
+    #[test]
+    fn pair_without_bind_is_accepted() {
+        // The URI gets a LAN address chosen at run time (`discovery::pair_ip`).
+        let cfg = parse(args("--no-vdd --pair")).unwrap().unwrap();
+        assert!(cfg.pair && cfg.bind.ip().is_unspecified());
     }
 
     #[test]

@@ -257,13 +257,13 @@ impl Reassembler {
                 i
             }
             None => {
-                if let Some(l) = self.last_finished {
-                    if !is_newer(header.frame_id, l) {
-                        if l.wrapping_sub(header.frame_id) <= RESTART_WINDOW {
-                            return Ok(PushOutcome::Ignored);
-                        }
-                        self.restart();
+                if let Some(l) = self.last_finished
+                    && !is_newer(header.frame_id, l)
+                {
+                    if l.wrapping_sub(header.frame_id) <= RESTART_WINDOW {
+                        return Ok(PushOutcome::Ignored);
                     }
+                    self.restart();
                 }
                 let count = usize::from(header.frag_count);
                 let data = usize::from(header.data_count());

@@ -99,7 +99,8 @@ impl FragmentHeader {
         if self.frag_index >= self.frag_count {
             return Err("fragment.frag_index");
         }
-        if payload_len == 0 || payload_len % 2 != 0 || payload_len > MAX_FRAGMENT_PAYLOAD {
+        if payload_len == 0 || !payload_len.is_multiple_of(2) || payload_len > MAX_FRAGMENT_PAYLOAD
+        {
             return Err("fragment.payload");
         }
         Ok(())

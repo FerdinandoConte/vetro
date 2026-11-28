@@ -7,3 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 publish.workspace = true
+
+[dependencies]
+vetro-protocol = { path = "../vetro-protocol" }
+vetro-transport = { path = "../vetro-transport" }
+tokio = { version = "1.54.1", default-features = false, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }

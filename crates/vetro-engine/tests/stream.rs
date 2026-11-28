@@ -105,7 +105,7 @@ async fn start_stream(c: &mut ClientSession) {
 /// Receives `FRAMES` complete frames, checking every byte; asks for a keyframe halfway and
 /// expects one. With `fresh` the stream just opened: if its first complete frame is not a
 /// keyframe (frame 0 was dropped or lost, both allowed, ARCHITECTURE section 10) the client asks
-/// for one, as a real client does; see `assert_opens_with_keyframe` for the check. Returns
+/// for one on every frame until a keyframe arrives, as a real client does; see `assert_opens_with_keyframe` for the check. Returns
 /// `(frame_id, len, keyframe)` of each.
 async fn receive(c: &mut ClientSession, fresh: bool) -> Vec<(u32, usize, bool)> {
     let mut reassembler = Reassembler::new(ReassemblerConfig {
@@ -132,7 +132,7 @@ async fn receive(c: &mut ClientSession, fresh: bool) -> Vec<(u32, usize, bool)> 
         assert_eq!(f.data, &want[..], "frame {} content", f.info.frame_id);
         assert!(f.data.len() > 1000, "realistic size");
         let key = f.info.flags.contains(FrameFlags::KEYFRAME);
-        if fresh && got.is_empty() && !key {
+        if fresh && !key && !got.iter().any(|g| g.2) {
             let kf = ControlMessage::KeyframeRequest(KeyframeRequest { lost_frame_id: 0 });
             c.control_tx.send(&kf).await.unwrap();
         }
@@ -231,7 +231,7 @@ fn assert_opens_with_keyframe(lines: &[String], session: u64, received: &[(u32, 
     let cause = if frame0.is_some() {
         "frame 0 is in the telemetry: lost on the network"
     } else {
-        "frame 0 is not in the telemetry: dropped from the mailbox"
+        "frame 0 not sent (mailbox drop); the later keyframe did not arrive either"
     };
     let ids: Vec<u32> = received.iter().map(|r| r.0).collect();
     assert!(

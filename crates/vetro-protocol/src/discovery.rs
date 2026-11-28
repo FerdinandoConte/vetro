@@ -166,6 +166,25 @@ mod tests {
         assert_eq!((a.major, a.fingerprint), (1, [0xab; 32]));
     }
 
+    // Keys that hit the parser's branches most of the time, values near the accepted shapes.
+    fn key() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("v".to_string()),
+            Just("V".to_string()),
+            Just("fp".to_string()),
+            Just("FP".to_string()),
+            ".{0,6}",
+        ]
+    }
+
+    fn value() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            "[0-9a-fA-F]{60,66}".prop_map(String::into_bytes),
+            "[0-9+ -]{0,7}".prop_map(String::into_bytes),
+            proptest::collection::vec(any::<u8>(), 0..80),
+        ]
+    }
+
     proptest! {
         #[test]
         fn roundtrip(major in any::<u16>(), fingerprint in any::<[u8; 32]>()) {
@@ -177,10 +196,7 @@ mod tests {
         // anything it accepts must re-encode to the same values.
         #[test]
         fn arbitrary_records_never_panic(
-            raw in proptest::collection::vec(
-                (".{0,6}", proptest::option::of(proptest::collection::vec(any::<u8>(), 0..80))),
-                0..8,
-            ),
+            raw in proptest::collection::vec((key(), proptest::option::of(value())), 0..8),
             seed_valid in any::<bool>(),
         ) {
             let mut e: Vec<(&str, Option<&[u8]>)> =

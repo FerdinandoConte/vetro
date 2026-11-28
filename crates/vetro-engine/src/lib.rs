@@ -114,7 +114,7 @@ impl Engine {
         let ip = discovery::pair_ip(addr, &discovery::lan_ipv4s()).ok_or_else(|| {
             Error::Io(std::io::Error::new(
                 std::io::ErrorKind::AddrNotAvailable,
-                "no LAN IPv4 address for the pairing URI: join a network or pass --bind <IP>:port",
+                "no LAN IPv4 address for the pairing URI: join a network or pass --bind <LAN IP>:47800",
             ))
         })?;
         let t: String = token.0.iter().map(|b| format!("{b:02x}")).collect();
@@ -170,7 +170,7 @@ impl Engine {
         if let Some(a) = advertiser {
             // Withdraw first, so no tablet is sent to an engine that is going away. The goodbye
             // waits on a thread: not on an async worker.
-            let _ = tokio::task::spawn_blocking(move || a.stop()).await;
+            let _ = tokio::task::spawn_blocking(move || drop(a)).await;
         }
         self.host.close();
         let _ = tokio::time::timeout(CLOSE_WAIT, self.host.wait_idle()).await;

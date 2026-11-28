@@ -19,7 +19,9 @@ use vetro_protocol::version::PROTOCOL_VERSION;
 pub struct DiscoveredHost {
     /// Instance name (the PC's name), for display.
     pub name: String,
-    /// SHA-256 of the host certificate; compare with the pinned fingerprint of a paired host.
+    /// SHA-256 of the host certificate, as claimed by an unauthenticated advertisement: a hint
+    /// for matching the pins already stored (see [`paired_hosts`]). Never pin it for a new
+    /// host: the pairing QR is the only trusted source of a fingerprint.
     pub fingerprint: [u8; 32],
     /// IPv4 addresses, sorted. Never empty. The engine listens on IPv4 only.
     pub addrs: Vec<Ipv4Addr>,

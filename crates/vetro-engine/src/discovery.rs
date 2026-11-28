@@ -25,7 +25,10 @@ pub struct Nic {
 /// "Ethernet N" adapter) must never match.
 /// shortcut: name heuristics only; Windows' interface type (IfType) and the physical-media flag
 /// would be exact but need `unsafe` FFI, which this crate forbids. Revisit if an owner's
-/// machine advertises the wrong adapter first.
+/// machine advertises the wrong adapter first. Known case: with a Hyper-V *external* switch the
+/// PC's real address moves to an adapter named "vEthernet (External...)", which this list
+/// drops, so the engine finds no address (`--pair` then asks for `--bind <LAN IP>:47800` and
+/// no mDNS is announced). Fix when seen: match the switch names the owner actually has.
 const VIRTUAL_NAMES: &[&str] = &[
     "vethernet",
     "virtualbox",
@@ -103,13 +106,14 @@ pub fn dial_addrs(bound: SocketAddr, lan: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
 }
 
 /// The address for the pairing URI's `a=`: the bound address when the owner chose one with
-/// `--bind` (even loopback, for a test client on the same machine); for a wildcard bind the
-/// first of `lan`; `None` when there is none.
+/// `--bind` (even loopback, for a test client on the same machine); for the IPv4 wildcard
+/// `0.0.0.0` the first of `lan`; `None` when there is none. `[::]` gets `None` too: on Windows
+/// an IPv6 socket is v6-only, so no IPv4 address would reach it.
 pub fn pair_ip(bound: SocketAddr, lan: &[Ipv4Addr]) -> Option<IpAddr> {
-    if bound.ip().is_unspecified() {
-        lan.first().map(|ip| IpAddr::V4(*ip))
-    } else {
-        Some(bound.ip())
+    match bound.ip() {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED) => lan.first().map(|ip| IpAddr::V4(*ip)),
+        IpAddr::V6(ip) if ip.is_unspecified() => None,
+        ip => Some(ip),
     }
 }
 
@@ -171,13 +175,23 @@ impl Advertiser {
         info.set_interfaces(addrs.iter().map(|a| IfKind::Addr((*a).into())).collect());
         let fullname = info.get_fullname().to_string();
         let daemon = ServiceDaemon::new()?;
-        daemon.disable_interface(IfKind::IPv6)?;
+        // Only the advertised addresses' interfaces answer: nothing on virtual adapters, no IPv6.
+        daemon.disable_interface(IfKind::All)?;
+        daemon.enable_interface(
+            addrs
+                .iter()
+                .map(|a| IfKind::Addr((*a).into()))
+                .collect::<Vec<_>>(),
+        )?;
         daemon.register(info)?;
         Ok(Self { daemon, fullname })
     }
+}
 
-    /// Sends the goodbye and stops the daemon thread; gives up after one second each.
-    pub fn stop(self) {
+impl Drop for Advertiser {
+    /// Sends the goodbye and stops the daemon thread; waits up to one second for each. Blocks:
+    /// not on an async worker.
+    fn drop(&mut self) {
         let wait = Duration::from_secs(1);
         if let Ok(rx) = self.daemon.unregister(&self.fullname) {
             let _ = rx.recv_timeout(wait);
@@ -258,10 +272,7 @@ mod tests {
             at("0.0.0.0:47800", &lan),
             Some("192.168.1.20".parse().unwrap())
         );
-        assert_eq!(
-            at("[::]:47800", &lan),
-            Some("192.168.1.20".parse().unwrap())
-        );
+        assert_eq!(at("[::]:47800", &lan), None, "v6-only socket on Windows");
         assert_eq!(at("10.0.0.5:1", &lan), Some("10.0.0.5".parse().unwrap()));
         assert_eq!(at("127.0.0.1:1", &lan), Some("127.0.0.1".parse().unwrap()));
         assert_eq!(at("0.0.0.0:47800", &[]), None, "no interface: refuse");

@@ -1,6 +1,8 @@
 //! The engine's advertisement is found by the client's browser, and gone after the engine
-//! withdraws it. Real multicast on this machine's LAN interface, so it needs a network and
-//! (on Windows) the firewall rule for private networks: run with `--ignored`.
+//! withdraws it. Real multicast, but engine and browser are on the same host: it proves the
+//! records and the code paths, not that another device on the LAN receives them. Reach from
+//! the tablet (including the Windows firewall profile) belongs to the M1 manual checklist.
+//! Needs a network interface with multicast: run with `--ignored`.
 
 use std::time::{Duration, Instant};
 use vetro_client::discovery::{Browser, HostEvent};
@@ -41,7 +43,7 @@ fn client_browse_finds_the_engine_and_sees_it_leave() {
         host.addrs
     );
 
-    advertiser.stop();
+    drop(advertiser); // withdraws
     let until = Instant::now() + WAIT;
     loop {
         let left = until.saturating_duration_since(Instant::now());

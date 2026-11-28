@@ -225,20 +225,14 @@ pub async fn run<D: Decoder>(
                         request(id);
                     }
                     v.check_loss(Some(header.frame_id), received_us, window_us, stats, &request);
-                }
-                Some(e) = events_rx.recv() => {
-                    let done = match e {
-                        DecoderEvent::Decoded { frame_id, at_us, render_pending } => {
-                            stats.frame_decoded();
-                            times.decoded(frame_id, at_us, render_pending)
-                        }
-                        DecoderEvent::Rendered { frame_id, at_us } => times.rendered(frame_id, at_us),
-                        DecoderEvent::Error(e) => return Err(Error::Decoder(e)),
-                    };
-                    if let Some(t) = done {
-                        let _ = tel.try_send(TelemetryMessage::ClientFrame(t));
+                    // During a datagram burst this arm stays ready and the other arms may not
+                    // get a turn (tokio's cooperative budget runs out), so take decoder events
+                    // here too; otherwise their frames' records are overwritten unreported.
+                    while let Ok(e) = events_rx.try_recv() {
+                        on_event(e, &mut times, stats, &tel)?;
                     }
                 }
+                Some(e) = events_rx.recv() => on_event(e, &mut times, stats, &tel)?,
                 _ = expire_tick.tick() => {
                     if let Some(v) = &mut video {
                         let now_us = clock.now_us();
@@ -258,6 +252,32 @@ pub async fn run<D: Decoder>(
         r = main => r,
         r = background => r,
     }
+}
+
+/// Records a decoder event; a finished frame record goes to the telemetry queue (dropped when
+/// full).
+fn on_event(
+    e: DecoderEvent,
+    times: &mut FrameTimes,
+    stats: &Stats,
+    tel: &mpsc::Sender<TelemetryMessage>,
+) -> Result<(), Error> {
+    let done = match e {
+        DecoderEvent::Decoded {
+            frame_id,
+            at_us,
+            render_pending,
+        } => {
+            stats.frame_decoded();
+            times.decoded(frame_id, at_us, render_pending)
+        }
+        DecoderEvent::Rendered { frame_id, at_us } => times.rendered(frame_id, at_us),
+        DecoderEvent::Error(e) => return Err(Error::Decoder(e)),
+    };
+    if let Some(t) = done {
+        let _ = tel.try_send(TelemetryMessage::ClientFrame(t));
+    }
+    Ok(())
 }
 
 /// Reassembly state of the configured stream.

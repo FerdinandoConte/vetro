@@ -250,11 +250,14 @@ async fn frames_arrive_in_order_with_telemetry_and_clock_sync_then_stop() {
     let mut run = start(&rig, None, vec![]);
     let mut h = configured(&rig, &run).await;
 
+    // One burst of FRAMES frames, several times the client's 16 in-flight telemetry slots: a
+    // session loop that leaves decoder events waiting behind datagrams loses records here.
+    const FRAMES: u32 = 60;
     let mut frag = Fragmenter::new();
-    for id in 0..30 {
+    for id in 0..FRAMES {
         send(&h, &mut frag, id, 20);
     }
-    expect_frames(&mut run, 0..30).await;
+    expect_frames(&mut run, 0..FRAMES).await;
 
     // Clock sync: the first probe goes out at once; the estimate is within RTT/2.
     within(async {
@@ -281,7 +284,7 @@ async fn frames_arrive_in_order_with_telemetry_and_clock_sync_then_stop() {
         }
     }
     let mut telemetry = telemetry.expect("client telemetry stream");
-    for want in 0..30 {
+    for want in 0..FRAMES {
         let Some(TelemetryMessage::ClientFrame(t)) = within(telemetry.recv()).await.unwrap() else {
             panic!("expected ClientFrame");
         };
@@ -300,7 +303,8 @@ async fn frames_arrive_in_order_with_telemetry_and_clock_sync_then_stop() {
     }
 
     let s = run.stats.snapshot();
-    assert_eq!((s.frames_complete, s.frames_decoded), (30, 30));
+    let n = u64::from(FRAMES);
+    assert_eq!((s.frames_complete, s.frames_decoded), (n, n));
     assert_eq!(
         (s.frames_lost, s.keyframe_requests, s.bad_datagrams),
         (0, 0, 0)

@@ -23,16 +23,23 @@
 //!     /** One of the STATE_* values below. */
 //!     @JvmStatic external fun nativeState(handle: Long): Int
 //!
+//!     /** The host sent `Configure` at some point in this session: on a first connection the
+//!      *  pairing is confirmed, so persist the host. Stays true after the session ends. */
+//!     @JvmStatic external fun nativePaired(handle: Long): Boolean
+//!
 //!     /** Stops the session and frees the handle. Call exactly once per handle, before the
 //!      *  surface is destroyed. Blocks until the session thread has ended. */
 //!     @JvmStatic external fun nativeStop(handle: Long)
 //! }
 //! ```
 //!
-//! States: `0` connecting, `1` streaming (the host sent `Configure`; on a first connection the
-//! pairing is now confirmed, so persist the host), `2` ended (stopped, or the host said `Bye`),
-//! `3` not paired (wrong, used or expired token; also when the host closes with code 2 right
-//! after connecting), `4` failed (anything else).
+//! States: `0` connecting, `1` streaming (the host sent `Configure`), `2` ended (stopped, or the
+//! host said `Bye`), `3` not paired (wrong, used or expired token; also when the host closes with
+//! code 2 right after connecting), `4` failed (anything else, a panic included).
+//!
+//! `nativeStart` returns 0 for: a non-IP `host`, port 0 or out of range, a fingerprint that is
+//! not 32 bytes, a token that is not null or 16 bytes, a path that is not valid UTF-8, a mode
+//! outside the protocol limits (1..=16384 pixels, 1..=1000 Hz) or density 0, a null surface.
 //!
 //! The session thread runs a current-thread tokio runtime at `THREAD_PRIORITY_URGENT_DISPLAY`
 //! (ARCHITECTURE section 10): it is the thread that queues every access unit.
@@ -43,7 +50,9 @@ use crate::clock::Clock;
 use crate::session::{self, Config, Error};
 use crate::telemetry::Stats;
 use codec::{MediaCodecDecoder, Window};
-use jni_sys::{JNIEnv, jbyte, jbyteArray, jclass, jint, jlong, jobject, jstring};
+use jni_sys::{
+    JNI_FALSE, JNI_TRUE, JNIEnv, jboolean, jbyte, jbyteArray, jclass, jint, jlong, jobject, jstring,
+};
 use std::ffi::CStr;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -51,8 +60,9 @@ use std::ptr::null_mut;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::thread::JoinHandle;
+use std::time::Duration;
 use tokio::sync::oneshot;
-use vetro_protocol::messages::{Display, PairToken};
+use vetro_protocol::messages::{Display, MAX_DIMENSION, MAX_REFRESH_MHZ, PairToken};
 use vetro_transport::{Client, Fingerprint, Identity};
 
 const STATE_CONNECTING: i32 = 0;
@@ -60,6 +70,9 @@ const STATE_STREAMING: i32 = 1;
 const STATE_ENDED: i32 = 2;
 const STATE_NOT_PAIRED: i32 = 3;
 const STATE_FAILED: i32 = 4;
+
+/// How long the session thread waits for the close packet to leave.
+const CLOSE_FLUSH: Duration = Duration::from_millis(100);
 
 /// Android `THREAD_PRIORITY_URGENT_DISPLAY`.
 const URGENT_DISPLAY: libc::c_int = -8;
@@ -112,7 +125,14 @@ pub unsafe extern "system" fn Java_dev_vetro_app_VetroCore_nativeStart(
             refresh_mhz: u32::try_from(refresh_mhz).ok()?,
             density_dpi: u16::try_from(density_dpi).ok()?,
         };
-        if surface.is_null() {
+        // The protocol's limits, so `Capabilities` cannot fail to encode later.
+        let size = 1..=MAX_DIMENSION;
+        if !size.contains(&display.width)
+            || !size.contains(&display.height)
+            || !(1..=MAX_REFRESH_MHZ).contains(&display.refresh_mhz)
+            || display.density_dpi == 0
+            || surface.is_null()
+        {
             return None;
         }
         // SAFETY: as above; `surface` is a non-null android.view.Surface.
@@ -138,10 +158,11 @@ pub unsafe extern "system" fn Java_dev_vetro_app_VetroCore_nativeStart(
         .name("vetro-session".into())
         .spawn(move || {
             let decoder = MediaCodecDecoder::new(window);
-            st.store(
-                session_thread(cfg, &path, decoder, &ss, stop_rx),
-                Ordering::Release,
-            );
+            // A panic must still end in a final state, or the app polls "connecting" forever.
+            let end = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                session_thread(cfg, &path, decoder, &ss, stop_rx)
+            }));
+            st.store(end.unwrap_or(STATE_FAILED), Ordering::Release);
         });
     match thread {
         Ok(thread) => Box::into_raw(Box::new(Handle {
@@ -170,6 +191,26 @@ pub unsafe extern "system" fn Java_dev_vetro_app_VetroCore_nativeState(
     match h.state.load(Ordering::Acquire) {
         STATE_CONNECTING if h.stats.snapshot().streaming => STATE_STREAMING,
         s => s,
+    }
+}
+
+/// # Safety
+/// `handle` is 0 or a value from `nativeStart` not yet passed to `nativeStop`.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_vetro_app_VetroCore_nativePaired(
+    _env: *mut JNIEnv,
+    _class: jclass,
+    handle: jlong,
+) -> jboolean {
+    if handle == 0 {
+        return JNI_FALSE;
+    }
+    // SAFETY: guaranteed by the caller: a live `Handle` from `nativeStart`.
+    let h = unsafe { &*(handle as *const Handle) };
+    if h.stats.snapshot().streaming {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
     }
 }
 
@@ -217,7 +258,12 @@ fn session_thread(
         let stop = async {
             let _ = stop.await;
         };
-        session::run(&client, &cfg, &mut decoder, stats, stop).await
+        let r = session::run(&client, &cfg, &mut decoder, stats, stop).await;
+        // `run` closed the connection; let the close packet leave before the runtime is
+        // dropped, or the host only notices after its idle timeout. Bounded, because
+        // `nativeStop` blocks the caller until this thread ends.
+        let _ = tokio::time::timeout(CLOSE_FLUSH, client.wait_idle()).await;
+        r
     });
     match result {
         Ok(_) => STATE_ENDED,

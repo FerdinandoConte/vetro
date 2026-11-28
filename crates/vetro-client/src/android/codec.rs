@@ -18,6 +18,7 @@ use ndk_sys as sys;
 use std::ffi::{CStr, c_char, c_void};
 use std::ptr::{NonNull, null_mut};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc;
 use vetro_protocol::datagram::FrameInfo;
 use vetro_protocol::messages::{Configure, Profile};
@@ -72,6 +73,9 @@ struct Shared {
     inputs: mpsc::SyncSender<usize>,
     events: DecoderEvents,
     render_events: bool,
+    /// The codec's async error status, 0 while healthy. Sticky, because the error event can be
+    /// dropped when the event queue is full: `decode` fails from then on.
+    error: AtomicI32,
 }
 
 /// A started codec. Drop stops and deletes it before `shared`, which its callbacks read, is
@@ -79,7 +83,7 @@ struct Shared {
 struct Codec {
     ptr: NonNull<sys::AMediaCodec>,
     inputs: mpsc::Receiver<usize>,
-    _shared: Box<Shared>,
+    shared: Box<Shared>,
 }
 
 // SAFETY: AMediaCodec may be called from any thread. `Codec` is used by one thread at a time
@@ -89,7 +93,7 @@ unsafe impl Send for Codec {}
 impl Drop for Codec {
     fn drop(&mut self) {
         // SAFETY: `ptr` is a codec we own. AMediaCodec_delete stops its looper, so no callback
-        // runs after it returns and `_shared` (dropped after this body) is no longer read.
+        // runs after it returns and `shared` (dropped after this body) is no longer read.
         unsafe {
             sys::AMediaCodec_stop(self.ptr.as_ptr());
             sys::AMediaCodec_delete(self.ptr.as_ptr());
@@ -122,27 +126,34 @@ fn create(mime: &CStr) -> Option<NonNull<sys::AMediaCodec>> {
     NonNull::new(unsafe { sys::AMediaCodec_createDecoderByType(mime.as_ptr()) })
 }
 
+fn probe_profiles() -> Vec<Profile> {
+    let has = |mime: &CStr| {
+        create(mime).is_some_and(|c| {
+            // SAFETY: a probe codec we own and never use again.
+            unsafe { sys::AMediaCodec_delete(c.as_ptr()) };
+            true
+        })
+    };
+    let mut out = Vec::new();
+    if has(c"video/hevc") {
+        out.push(Profile::HevcMain);
+    }
+    if has(c"video/avc") {
+        out.extend([
+            Profile::H264High,
+            Profile::H264Main,
+            Profile::H264ConstrainedBaseline,
+        ]);
+    }
+    out
+}
+
 impl Decoder for MediaCodecDecoder {
     fn profiles(&self) -> Vec<Profile> {
-        let has = |mime: &CStr| {
-            create(mime).is_some_and(|c| {
-                // SAFETY: a probe codec we own and never use again.
-                unsafe { sys::AMediaCodec_delete(c.as_ptr()) };
-                true
-            })
-        };
-        let mut out = Vec::new();
-        if has(c"video/hevc") {
-            out.push(Profile::HevcMain);
-        }
-        if has(c"video/avc") {
-            out.extend([
-                Profile::H264High,
-                Profile::H264Main,
-                Profile::H264ConstrainedBaseline,
-            ]);
-        }
-        out
+        // Probing creates codecs (tens of ms each) on the session thread, where `stop` cannot
+        // interrupt it: do it once per process.
+        static PROFILES: OnceLock<Vec<Profile>> = OnceLock::new();
+        PROFILES.get_or_init(probe_profiles).clone()
     }
 
     fn configure(&mut self, cfg: &Configure, events: DecoderEvents) -> Result<(), DecoderError> {
@@ -161,13 +172,14 @@ impl Decoder for MediaCodecDecoder {
         let codec = Codec {
             ptr,
             inputs,
-            _shared: Box::new(Shared {
+            shared: Box::new(Shared {
                 inputs: tx,
                 events,
                 render_events: set_rendered.is_some(),
+                error: AtomicI32::new(0),
             }),
         };
-        let userdata = (&raw const *codec._shared).cast_mut().cast::<c_void>();
+        let userdata = (&raw const *codec.shared).cast_mut().cast::<c_void>();
         let c = ptr.as_ptr();
 
         let format = Format::new()?;
@@ -213,6 +225,13 @@ impl Decoder for MediaCodecDecoder {
             what: "not configured",
             code: 0,
         })?;
+        let code = codec.shared.error.load(Ordering::Acquire);
+        if code != 0 {
+            return Err(DecoderError {
+                what: "codec error",
+                code,
+            });
+        }
         let Ok(idx) = codec.inputs.try_recv() else {
             return Ok(false);
         };
@@ -366,9 +385,13 @@ unsafe extern "C" fn on_error(
 ) {
     // SAFETY: called by the codec with the userdata registered in `configure`.
     let s = unsafe { shared(userdata) };
+    // Any status, even 0, marks the codec failed.
+    let code = if error.0 == 0 { -1 } else { error.0 };
+    s.error.store(code, Ordering::Release);
+    // Wakes the session if it is idle; `decode` reports it otherwise.
     s.events.send(DecoderEvent::Error(DecoderError {
         what: "codec error",
-        code: error.0,
+        code,
     }));
 }
 

@@ -929,6 +929,7 @@ dependencies = [
  "jni-sys 0.3.1",
  "libc",
  "ndk-sys",
+ "quinn",
  "tokio",
  "vetro-protocol",
  "vetro-transport",

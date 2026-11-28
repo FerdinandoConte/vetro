@@ -24,4 +24,6 @@ libc = "0.2.191"
 ndk-sys = { version = "0.6.0", features = ["media"] }
 
 [dev-dependencies]
+# Only to read the close code the host saw (already in the tree through vetro-transport).
+quinn = { version = "0.11.12", default-features = false }
 tokio = { version = "1.54.1", default-features = false, features = ["macros", "rt-multi-thread", "time"] }

@@ -591,6 +591,13 @@ impl Client {
             .await
     }
 
+    /// Resolves once every connection has finished closing, so the close packet has left
+    /// before the runtime is dropped. Bound it with a timeout: a host that vanished is waited
+    /// for until its connection times out.
+    pub async fn wait_idle(&self) {
+        self.endpoint.wait_idle().await;
+    }
+
     async fn connect_with(
         &self,
         addr: SocketAddr,

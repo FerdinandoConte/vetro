@@ -84,6 +84,7 @@ jobs:
         with:
           toolchain: stable
           targets: aarch64-linux-android
+          components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
         with:
@@ -95,6 +96,13 @@ jobs:
         with:
           ndk-version: r28c
           link-to-sdk: true
+      # The Android-only code (JNI, AMediaCodec, all of the crate's unsafe) is invisible to the
+      # host clippy runs above.
+      - name: Clippy for Android
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
+        run: cargo ndk -t arm64-v8a clippy -p vetro-client -- -D warnings
       - name: Build libvetro_client.so
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}

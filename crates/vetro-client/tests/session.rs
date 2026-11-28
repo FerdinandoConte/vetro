@@ -12,8 +12,8 @@ use vetro_client::{Decoder, DecoderError, DecoderEvent, DecoderEvents};
 use vetro_protocol::Fragmenter;
 use vetro_protocol::datagram::{FrameFlags, FrameInfo};
 use vetro_protocol::messages::{
-    ClientFrameTimes, ClockSyncResponse, Configure, ControlMessage, Display, PairToken, Profile,
-    TelemetryMessage,
+    Bye, ByeReason, ClientFrameTimes, ClockSyncResponse, Configure, ControlMessage, Display,
+    PairToken, Profile, TelemetryMessage,
 };
 use vetro_transport::{
     Client, Error as TransportError, Fingerprint, Host, HostSession, Identity, PeerStream,
@@ -31,10 +31,12 @@ const DISPLAY: Display = Display {
     density_dpi: 274,
 };
 
-/// Records every access unit; drops the ids in `drop`; reports decode and render at once.
+/// Records every access unit; drops the ids in `drop`; reports a codec error on `fail`;
+/// reports decode and render at once.
 struct MockDecoder {
     frames: mpsc::UnboundedSender<(u32, Vec<u8>)>,
     drop: Vec<u32>,
+    fail: Option<u32>,
     events: Option<DecoderEvents>,
 }
 
@@ -55,6 +57,13 @@ impl Decoder for MockDecoder {
         self.frames.send((info.frame_id, data.to_vec())).unwrap();
         let ev = self.events.as_ref().unwrap();
         let frame_id = info.frame_id;
+        if self.fail == Some(frame_id) {
+            ev.send(DecoderEvent::Error(DecoderError {
+                what: "mock failure",
+                code: -38,
+            }));
+            return Ok(true);
+        }
         ev.send(DecoderEvent::Decoded {
             frame_id,
             at_us: ev.now_us(),
@@ -121,13 +130,18 @@ struct Running {
 }
 
 fn start(rig: &Rig, token: Option<PairToken>, drop: Vec<u32>) -> Running {
+    spawn(rig, rig.config(token), drop, None)
+}
+
+fn spawn(rig: &Rig, cfg: Config, drop: Vec<u32>, fail: Option<u32>) -> Running {
     let (tx, frames) = mpsc::unbounded_channel();
     let (stop, stop_rx) = oneshot::channel::<()>();
     let stats = Arc::new(Stats::default());
-    let (client, cfg, st) = (rig.client.clone(), rig.config(token), stats.clone());
+    let (client, st) = (rig.client.clone(), stats.clone());
     let mut dec = MockDecoder {
         frames: tx,
         drop,
+        fail,
         events: None,
     };
     let task = tokio::spawn(async move {
@@ -196,10 +210,17 @@ fn frame_bytes(id: u32) -> Vec<u8> {
         .collect()
 }
 
+/// Sends frame `id`; the ids in `KEYFRAMES` are flagged as keyframes (each test stream starts
+/// with one, or the client asks for one).
 fn send(h: &HostSession, frag: &mut Fragmenter, id: u32, fec_percent: u8) {
+    const KEYFRAMES: [u32; 3] = [0, 10, 100];
     let info = FrameInfo {
         frame_id: id,
-        flags: FrameFlags::empty(),
+        flags: if KEYFRAMES.contains(&id) {
+            FrameFlags::KEYFRAME
+        } else {
+            FrameFlags::empty()
+        },
         capture_ts_us: u64::from(id),
     };
     h.send_frame(frag, info, &frame_bytes(id), fec_percent)
@@ -312,7 +333,7 @@ async fn frames_arrive_in_order_with_telemetry_and_clock_sync_then_stop() {
 
     run.stop.send(()).unwrap();
     assert_eq!(within(run.task).await.unwrap().unwrap(), End::Stopped);
-    assert!(matches!(h.closed().await, TransportError::Connection(_)));
+    assert_eq!(close_code_of(h.closed().await), Some(close_code::NORMAL));
 }
 
 #[tokio::test]
@@ -416,4 +437,93 @@ async fn a_code_2_close_right_after_connect_is_a_failed_pairing() {
         Err(Error::NotPaired)
     ));
     assert!(!run.stats.snapshot().streaming);
+}
+
+/// The application close code the client used, as the host sees it.
+fn close_code_of(e: TransportError) -> Option<u32> {
+    match e {
+        TransportError::Connection(quinn::ConnectionError::ApplicationClosed(c)) => {
+            u32::try_from(c.error_code.into_inner()).ok()
+        }
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn stop_while_connecting_returns_at_once() {
+    // A UDP socket that never answers: connect would wait the full setup timeout (5 s).
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let rig = Rig::new(true);
+    let cfg = Config {
+        host: silent.local_addr().unwrap(),
+        ..rig.config(None)
+    };
+    let run = spawn(&rig, cfg, vec![], None);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let asked = std::time::Instant::now();
+    run.stop.send(()).unwrap();
+    assert_eq!(within(run.task).await.unwrap().unwrap(), End::Stopped);
+    // The bound is loose for slow CI runners; without the fix this takes 5 s.
+    assert!(
+        asked.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        asked.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_host_bye_ends_the_session() {
+    let rig = Rig::new(true);
+    let run = start(&rig, None, vec![]);
+    let mut h = configured(&rig, &run).await;
+    let bye = Bye {
+        reason: ByeReason::NoCommonCodec,
+    };
+    h.control_tx.send(&ControlMessage::Bye(bye)).await.unwrap();
+    assert_eq!(
+        within(run.task).await.unwrap().unwrap(),
+        End::Bye(ByeReason::NoCommonCodec)
+    );
+}
+
+#[tokio::test]
+async fn a_codec_error_ends_the_session() {
+    let rig = Rig::new(true);
+    let run = spawn(&rig, rig.config(None), vec![], Some(1));
+    let h = configured(&rig, &run).await;
+    let mut frag = Fragmenter::new();
+    send(&h, &mut frag, 0, 0);
+    send(&h, &mut frag, 1, 0);
+    match within(run.task).await.unwrap() {
+        Err(Error::Decoder(e)) => assert_eq!(e.code, -38),
+        other => panic!("expected a decoder error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_host_ending_the_control_stream_is_a_protocol_error_closed_with_code_1() {
+    let rig = Rig::new(true);
+    let run = start(&rig, None, vec![]);
+    let mut h = configured(&rig, &run).await;
+    h.control_tx.finish().unwrap();
+    assert!(matches!(
+        within(run.task).await.unwrap(),
+        Err(Error::Protocol(_))
+    ));
+    assert_eq!(
+        close_code_of(within(h.closed()).await),
+        Some(close_code::PROTOCOL_ERROR)
+    );
+}
+
+#[tokio::test]
+async fn a_stream_that_does_not_start_with_a_keyframe_requests_one() {
+    let rig = Rig::new(true);
+    let mut run = start(&rig, None, vec![]);
+    let mut h = configured(&rig, &run).await;
+    let mut frag = Fragmenter::new();
+    // The keyframe (4) was lost entirely and never counted: nothing came before it.
+    send(&h, &mut frag, 5, 0);
+    expect_frames(&mut run, [5]).await;
+    assert_eq!(keyframe_request(&rig, &mut h).await, 4);
 }

@@ -195,6 +195,28 @@ async fn pair_then_reconnect_with_pinned_certs_and_use_every_channel() {
 }
 
 #[tokio::test]
+async fn stream_acceptor_waits_beside_a_control_read() {
+    let rig = Rig::new(&[]);
+    let (_, client) = new_client();
+    let token = rig.host.start_pairing().unwrap();
+    let (h, c) = rig
+        .connect(&client, rig.host_id.fingerprint(), Some(token))
+        .await;
+    let (mut h, mut c) = (h.unwrap(), c.unwrap());
+    let streams = h.stream_acceptor();
+    let kf = ControlMessage::KeyframeRequest(KeyframeRequest { lost_frame_id: 1 });
+    c.input_tx
+        .send(&InputMessage::Batch(Vec::new()))
+        .await
+        .unwrap();
+    c.control_tx.send(&kf).await.unwrap();
+    // `control_rx` is a `&mut` borrow of the session; the acceptor borrows nothing of it.
+    let (msg, stream) = tokio::join!(h.control_rx.recv(), streams.accept());
+    assert_eq!(msg.unwrap(), Some(kf));
+    assert!(matches!(stream.unwrap(), PeerStream::Input(_)));
+}
+
+#[tokio::test]
 async fn an_unpaired_client_is_rejected_at_the_handshake() {
     let rig = Rig::new(&[]);
     let (_, client) = new_client();

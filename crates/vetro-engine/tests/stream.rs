@@ -21,6 +21,8 @@ use vetro_transport::{Client, ClientSession, Error, Fingerprint, Identity};
 const REFRESH_MHZ: u32 = 120_000;
 const FRAMES: usize = 30;
 const WAIT: Duration = Duration::from_secs(10);
+/// A session's first keyframe must reach the client within this many complete frames.
+const KEYFRAME_WINDOW: usize = 10;
 
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("vetro-engine-{name}-{}", std::process::id()));
@@ -101,14 +103,16 @@ async fn start_stream(c: &mut ClientSession) {
 }
 
 /// Receives `FRAMES` complete frames, checking every byte; asks for a keyframe halfway and
-/// expects one. With `fresh` the first frame must be the stream's opening keyframe. Returns
-/// `(frame_id, len)` of each.
-async fn receive(c: &mut ClientSession, fresh: bool) -> Vec<(u32, usize)> {
+/// expects one. With `fresh` the stream just opened: if its first complete frame is not a
+/// keyframe (frame 0 was dropped or lost, both allowed, ARCHITECTURE section 10) the client asks
+/// for one on every frame until a keyframe arrives, as a real client does; see `assert_opens_with_keyframe` for the check. Returns
+/// `(frame_id, len, keyframe)` of each.
+async fn receive(c: &mut ClientSession, fresh: bool) -> Vec<(u32, usize, bool)> {
     let mut reassembler = Reassembler::new(ReassemblerConfig {
         frame_timeout_us: 10_000_000,
         ..ReassemblerConfig::for_refresh(REFRESH_MHZ)
     });
-    let mut got: Vec<(u32, usize)> = Vec::new();
+    let mut got: Vec<(u32, usize, bool)> = Vec::new();
     let mut asked_at = None;
     let mut keyframe_after_ask = false;
     let deadline = Instant::now() + WAIT;
@@ -128,17 +132,15 @@ async fn receive(c: &mut ClientSession, fresh: bool) -> Vec<(u32, usize)> {
         assert_eq!(f.data, &want[..], "frame {} content", f.info.frame_id);
         assert!(f.data.len() > 1000, "realistic size");
         let key = f.info.flags.contains(FrameFlags::KEYFRAME);
-        if fresh && got.is_empty() {
-            assert!(
-                key && f.info.frame_id == 0,
-                "the stream starts with a keyframe"
-            );
+        if fresh && !key && !got.iter().any(|g| g.2) {
+            let kf = ControlMessage::KeyframeRequest(KeyframeRequest { lost_frame_id: 0 });
+            c.control_tx.send(&kf).await.unwrap();
         }
         if let Some(last) = got.last() {
             assert!(f.info.frame_id > last.0, "frames in order");
         }
         keyframe_after_ask |= key && asked_at.is_some_and(|id| f.info.frame_id > id);
-        got.push((f.info.frame_id, f.data.len()));
+        got.push((f.info.frame_id, f.data.len(), key));
         if got.len() == FRAMES / 2 {
             asked_at = Some(f.info.frame_id);
             let kf = ControlMessage::KeyframeRequest(KeyframeRequest {
@@ -203,14 +205,39 @@ fn telemetry(path: &Path) -> Vec<String> {
 }
 
 /// Every received frame of `session` has its line, with the received size.
-fn assert_logged(lines: &[String], session: u64, received: &[(u32, usize)]) {
-    for (id, len) in received {
+fn assert_logged(lines: &[String], session: u64, received: &[(u32, usize, bool)]) {
+    for (id, len, _) in received {
         let line = lines
             .iter()
             .find(|l| field(l, "session") == session && field(l, "frame_id") == u64::from(*id))
             .unwrap_or_else(|| panic!("session {session} frame {id} is in the telemetry"));
         assert_eq!(field(line, "encoded_bytes"), *len as u64);
     }
+}
+
+/// The host logged frame 0 of `session` as a keyframe (when it was not dropped from the mailbox),
+/// and the client got a keyframe within its first `KEYFRAME_WINDOW` complete frames. On failure the
+/// message says which loss it was: no frame 0 line = mailbox drop, a line = network loss.
+fn assert_opens_with_keyframe(lines: &[String], session: u64, received: &[(u32, usize, bool)]) {
+    let frame0 = lines
+        .iter()
+        .find(|l| field(l, "session") == session && field(l, "frame_id") == 0);
+    if let Some(l) = frame0 {
+        assert!(
+            l.contains("\"keyframe\":true"),
+            "session {session} frame 0 is not flagged as a keyframe: {l}"
+        );
+    }
+    let cause = if frame0.is_some() {
+        "frame 0 is in the telemetry: lost on the network"
+    } else {
+        "frame 0 not sent (mailbox drop); the later keyframe did not arrive either"
+    };
+    let ids: Vec<u32> = received.iter().map(|r| r.0).collect();
+    assert!(
+        received.iter().take(KEYFRAME_WINDOW).any(|r| r.2),
+        "session {session}: no keyframe in the first {KEYFRAME_WINDOW} frames; {cause}; received ids {ids:?}"
+    );
 }
 
 struct Running {
@@ -273,6 +300,7 @@ async fn in_process_engine_streams_and_shuts_down_cleanly() {
     let lines = telemetry(&tele);
     assert!(lines.len() >= FRAMES);
     assert_logged(&lines, 0, &received);
+    assert_opens_with_keyframe(&lines, 0, &received);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -330,6 +358,8 @@ async fn sessions_are_refused_replaced_and_ended() {
     assert_logged(&lines, 0, &first);
     assert_logged(&lines, 0, &more);
     assert_logged(&lines, 1, &second);
+    assert_opens_with_keyframe(&lines, 0, &first);
+    assert_opens_with_keyframe(&lines, 1, &second);
     assert!(
         lines.iter().all(|l| field(l, "session") <= 1),
         "sessions without a stream send no frames"
@@ -421,6 +451,8 @@ async fn binary_streams_moving_bars_to_a_paired_client() {
     let text = std::fs::read_to_string(&tele).unwrap();
     let whole = &text[..=text.rfind('\n').unwrap()];
     std::fs::write(&tele, whole).unwrap();
-    assert_logged(&telemetry(&tele), 0, &received);
+    let lines = telemetry(&tele);
+    assert_logged(&lines, 0, &received);
+    assert_opens_with_keyframe(&lines, 0, &received);
     std::fs::remove_dir_all(&dir).unwrap();
 }

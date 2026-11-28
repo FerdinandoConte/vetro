@@ -211,4 +211,17 @@ mod tests {
         }
         drop(pump); // joins the thread
     }
+
+    #[tokio::test]
+    async fn replacing_a_frame_forces_a_keyframe() {
+        let pump = Pump::start(Box::new(MovingBars::new(1_000_000, 8_000)), Clock::new()).unwrap();
+        let f0 = pump.mailbox.take().await;
+        pump.mailbox.recycle(f0.data);
+        // Nobody takes: frames replace each other, which must restart the chain.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let a = pump.mailbox.take().await;
+        let b = pump.mailbox.take().await;
+        assert!(a.info.frame_id > 1, "frames were replaced");
+        assert!(a.meta.keyframe || b.meta.keyframe);
+    }
 }

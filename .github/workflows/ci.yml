@@ -83,7 +83,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: stable
-          targets: aarch64-linux-android
+          targets: aarch64-linux-android,x86_64-linux-android
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
@@ -107,13 +107,22 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
           ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
-        run: cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build -p vetro-client --release
+        # x86_64 next to arm64-v8a: the emulator (ARCHITECTURE section 14); must match abiFilters in app/build.gradle.kts.
+        run: cargo ndk -t arm64-v8a -t x86_64 -o android/app/src/main/jniLibs build -p vetro-client --release
       - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
           java-version: "17"
       - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
         with:
-          gradle-version: "9.6.0"
-      - run: gradle assembleDebug
+          validate-wrappers: true
+      # The wrapper pins Gradle 9.6.0 and its SHA-256 (android/gradle/wrapper/gradle-wrapper.properties).
+      - name: Kotlin unit tests and debug APK
+        run: ./gradlew testDebugUnitTest assembleDebug --stacktrace
         working-directory: android
+      # What the owner installs on the tablet (docs/it/GUIDA.md, section 14 bis). Debug-signed, 14 days.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vetro-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 14

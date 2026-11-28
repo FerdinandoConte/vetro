@@ -11,11 +11,13 @@
 //! - [`Fragmenter`] / [`Reassembler`]: frame fragmentation with Reed–Solomon parity, and bounded
 //!   reassembly with FEC recovery.
 //! - [`version`]: protocol version and negotiation.
+//! - [`discovery`]: the mDNS TXT record of a host.
 #![forbid(unsafe_code)]
 // Macros bypass clippy.toml's disallowed-methods, so printing is denied here.
 #![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 
 pub mod datagram;
+pub mod discovery;
 mod error;
 mod fragment;
 pub mod messages;

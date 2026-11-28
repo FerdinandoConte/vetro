@@ -918,6 +918,7 @@ version = "0.0.0"
 name = "vetro-engine"
 version = "0.0.0"
 dependencies = [
+ "quinn",
  "tokio",
  "vetro-protocol",
  "vetro-transport",

@@ -25,6 +25,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use telemetry::{FrameRecord, Telemetry};
 use tokio::sync::mpsc;
 use vetro_protocol::Fragmenter;
@@ -36,9 +37,19 @@ use vetro_transport::{
 };
 
 /// Reed–Solomon parity per frame.
-/// shortcut: fixed 10 %; adaptive 0–25 % from the client's measured loss comes with rate
-/// control (M1-7), 0 % on USB with M1-14.
+/// shortcut: fixed 10 %; section 7 wants adaptive 5–25 % on Wi-Fi from the client's measured
+/// loss (with rate control, M1-7) and 0 % on USB (M1-14).
 const FEC_PERCENT: u8 = 10;
+
+/// A control reply that cannot be queued in this time means the client stopped reading its
+/// control stream; the session is closed rather than left frozen.
+const CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long a clean stop waits for the close packets to leave.
+const CLOSE_WAIT: Duration = Duration::from_millis(500);
+
+/// Lowest refresh the engine streams at; protocol validation caps the top.
+const MIN_REFRESH_MHZ: u32 = 10_000;
 
 fn log(args: fmt::Arguments<'_>) {
     // Cold path only: session start/end and refused connections, never per frame.
@@ -129,7 +140,7 @@ impl Engine {
 
         tokio::pin!(shutdown);
         let mut next = None;
-        loop {
+        for session_no in 0u32.. {
             let session = match next.take() {
                 Some(s) => s,
                 None => tokio::select! {
@@ -137,7 +148,10 @@ impl Engine {
                     Some(s) = sessions.recv() => s,
                 },
             };
-            match self.serve(session, &mut sessions, &mut shutdown).await {
+            match self
+                .serve(session, session_no, &mut sessions, &mut shutdown)
+                .await
+            {
                 End::Replaced(s) => next = Some(*s),
                 End::Closed => {}
                 End::Shutdown => break,
@@ -146,6 +160,7 @@ impl Engine {
 
         acceptor.abort();
         self.host.close();
+        let _ = tokio::time::timeout(CLOSE_WAIT, self.host.wait_idle()).await;
         let dropped = self.telemetry.dropped();
         if dropped > 0 {
             log(format_args!("{dropped} telemetry records dropped"));
@@ -158,6 +173,7 @@ impl Engine {
     async fn serve<F: Future<Output = ()>>(
         &self,
         mut s: HostSession,
+        session_no: u32,
         sessions: &mut mpsc::Receiver<HostSession>,
         shutdown: &mut Pin<&mut F>,
     ) -> End {
@@ -211,7 +227,7 @@ impl Engine {
                 frame = next_frame(pump.as_ref()) => {
                     // `next_frame` only yields while a pump runs.
                     if let Some(p) = &pump
-                        && let Err(e) = self.send(&s, &mut fragmenter, p, frame)
+                        && let Err(e) = self.send(&s, session_no, &mut fragmenter, p, frame)
                     {
                         break (End::Closed, close_code::NORMAL, e.to_string());
                     }
@@ -219,7 +235,9 @@ impl Engine {
             }
         };
         s.close(code);
-        drop(pump); // joins the source thread (at most one frame interval)
+        drop(streams);
+        // Joining the source thread blocks up to `source::MAX_BLOCK`: not on an async worker.
+        let _ = tokio::task::spawn_blocking(move || drop(pump)).await;
         log(format_args!("session with {} ended: {why}", s.peer));
         end
     }
@@ -252,9 +270,7 @@ impl Engine {
                     host_recv_us,
                     host_send_us: self.clock.now_us(),
                 };
-                s.control_tx
-                    .send(&ControlMessage::ClockSyncResponse(resp))
-                    .await?;
+                send_control(s, &ControlMessage::ClockSyncResponse(resp)).await?;
             }
             ControlMessage::Bye(_) => return Ok(false),
             _ => {
@@ -270,6 +286,9 @@ impl Engine {
         let d = caps
             .display
             .ok_or(Error::Protocol("client Capabilities without a display"))?;
+        if d.refresh_mhz < MIN_REFRESH_MHZ {
+            return Err(Error::Protocol("client refresh rate below 10 Hz"));
+        }
         let configure = Configure {
             // shortcut: HEVC Main as on the reference hardware; negotiation is M1-7.
             profile: Profile::HevcMain,
@@ -278,9 +297,7 @@ impl Engine {
             refresh_mhz: d.refresh_mhz,
             bitrate_kbps: self.cfg.bitrate_kbps,
         };
-        s.control_tx
-            .send(&ControlMessage::Configure(configure))
-            .await?;
+        send_control(s, &ControlMessage::Configure(configure)).await?;
         let source: Box<dyn VideoSource> = match self.cfg.pattern {
             TestPattern::MovingBars => {
                 Box::new(MovingBars::new(d.refresh_mhz, self.cfg.bitrate_kbps))
@@ -294,6 +311,7 @@ impl Engine {
     fn send(
         &self,
         s: &HostSession,
+        session: u32,
         fragmenter: &mut Fragmenter,
         pump: &Pump,
         frame: EncodedFrame,
@@ -302,7 +320,11 @@ impl Engine {
         let send_us = self.clock.now_us();
         let out = match res {
             Ok(datagrams) => {
+                // shortcut: host frame times go to the JSONL only; sending them on the
+                // telemetry stream (`TelemetryMessage::HostFrame`) would put an awaited stream
+                // write in this loop, so it waits for the HIL harness (M1-11).
                 self.telemetry.record(FrameRecord {
+                    session,
                     frame_id: frame.info.frame_id,
                     keyframe: frame.meta.keyframe,
                     capture_us: frame.meta.capture_us,
@@ -324,6 +346,17 @@ impl Engine {
         pump.mailbox.recycle(frame.data);
         out
     }
+}
+
+/// Queues a control reply, giving up after [`CONTROL_SEND_TIMEOUT`] (the caller then closes the
+/// session with a protocol error), so a client that stops reading control cannot freeze the
+/// session loop.
+async fn send_control(s: &mut HostSession, msg: &ControlMessage) -> Result<(), Error> {
+    tokio::time::timeout(CONTROL_SEND_TIMEOUT, s.control_tx.send(msg))
+        .await
+        .unwrap_or(Err(Error::Stream(
+            "control reply timed out: client not reading",
+        )))
 }
 
 async fn next_frame(pump: Option<&Pump>) -> EncodedFrame {

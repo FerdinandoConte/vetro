@@ -76,8 +76,9 @@ struct Flags {
     keyframe: AtomicBool,
 }
 
-/// The running source thread; stopping (or dropping) it joins the thread, which takes at most
-/// one frame interval.
+/// The running source thread; dropping it joins the thread, which takes at most
+/// [`crate::source::MAX_BLOCK`] plus one frame's fill. Drop it off the async workers
+/// (`spawn_blocking`).
 pub struct Pump {
     flags: Arc<Flags>,
     thread: Option<JoinHandle<()>>,

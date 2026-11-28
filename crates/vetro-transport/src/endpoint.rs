@@ -299,6 +299,13 @@ impl Host {
     pub fn close(&self) {
         self.endpoint.close(close_code::NORMAL.into(), b"");
     }
+
+    /// Resolves once every connection has finished closing, so the close packets have left
+    /// before the process exits. Bound it with a timeout: a peer that vanished is waited for
+    /// until its connection times out.
+    pub async fn wait_idle(&self) {
+        self.endpoint.wait_idle().await;
+    }
 }
 
 /// Setups in progress, oldest first.
@@ -480,6 +487,9 @@ pub struct HostSession {
 
 /// Accepts the client's streams apart from the session, so one task can wait for them while it
 /// also reads `control_rx` (a `&mut` borrow of the session) and keeps every stream drained.
+///
+/// It holds a handle on the connection, which stays open until the session and every acceptor
+/// are dropped (or [`HostSession::close`] is called): drop it together with the session.
 #[derive(Clone)]
 pub struct StreamAcceptor(Connection);
 

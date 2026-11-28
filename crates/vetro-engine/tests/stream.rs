@@ -1,7 +1,8 @@
 //! The engine streams the synthetic source to a test client over 127.0.0.1: pairing,
 //! `Capabilities` → `Configure`, clock sync, keyframe request, frames through the Reassembler,
-//! telemetry JSONL and clean shutdown.
+//! telemetry JSONL, session replacement and ending, and clean shutdown.
 
+use std::collections::HashMap;
 use std::io::BufRead;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -11,11 +12,11 @@ use vetro_engine::source::moving_bars;
 use vetro_engine::{Config, Engine};
 use vetro_protocol::datagram::{Datagram, FrameFlags, decode_datagram};
 use vetro_protocol::messages::{
-    Capabilities, ClockSyncRequest, CodecSupport, ControlMessage, Display, InputMessage,
-    KeyframeRequest, LinkFeedback, PairToken, Profile, TelemetryMessage,
+    Bye, ByeReason, Capabilities, ClockSyncRequest, CodecSupport, Configure, ControlMessage,
+    Display, InputMessage, KeyframeRequest, LinkFeedback, PairToken, Profile, TelemetryMessage,
 };
 use vetro_protocol::{PushOutcome, Reassembler, ReassemblerConfig};
-use vetro_transport::{Client, ClientSession, Fingerprint, Identity};
+use vetro_transport::{Client, ClientSession, Error, Fingerprint, Identity};
 
 const REFRESH_MHZ: u32 = 120_000;
 const FRAMES: usize = 30;
@@ -28,19 +29,24 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// Pairs, starts the stream and checks the control replies.
-async fn connect(addr: SocketAddr, host: Fingerprint, token: PairToken) -> ClientSession {
-    let id = Identity::generate().unwrap();
-    let client = Client::bind("127.0.0.1:0".parse().unwrap(), &id).unwrap();
-    let mut c = client.connect(addr, host, Some(token)).await.unwrap();
-    let display = Display {
-        width: 2960,
-        height: 1848,
-        refresh_mhz: REFRESH_MHZ,
-        density_dpi: 274,
-    };
+fn new_client() -> Client {
+    Client::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        &Identity::generate().unwrap(),
+    )
+    .unwrap()
+}
+
+/// Sends `Capabilities` with a display at `refresh_mhz`; returns the host's reply (`None` if
+/// the host closed the stream or the session).
+async fn send_capabilities(c: &mut ClientSession, refresh_mhz: u32) -> Option<ControlMessage> {
     let caps = Capabilities {
-        display: Some(display.clone()),
+        display: Some(Display {
+            width: 2960,
+            height: 1848,
+            refresh_mhz,
+            density_dpi: 274,
+        }),
         codecs: vec![CodecSupport {
             profile: Profile::HevcMain,
             max_width: 2960,
@@ -52,7 +58,12 @@ async fn connect(addr: SocketAddr, host: Fingerprint, token: PairToken) -> Clien
         .send(&ControlMessage::Capabilities(caps))
         .await
         .unwrap();
-    let Some(ControlMessage::Configure(cfg)) = c.control_rx.recv().await.unwrap() else {
+    c.control_rx.recv().await.ok().flatten()
+}
+
+/// Starts the stream and checks the control replies.
+async fn start_stream(c: &mut ClientSession) {
+    let Some(ControlMessage::Configure(cfg)) = send_capabilities(c, REFRESH_MHZ).await else {
         panic!("host must answer Capabilities with Configure");
     };
     assert_eq!(
@@ -87,12 +98,12 @@ async fn connect(addr: SocketAddr, host: Fingerprint, token: PairToken) -> Clien
         frames_lost: 0,
     });
     c.telemetry_tx.send(&feedback).await.unwrap();
-    c
 }
 
 /// Receives `FRAMES` complete frames, checking every byte; asks for a keyframe halfway and
-/// expects one. Returns `(frame_id, len)` of each.
-async fn receive(c: &mut ClientSession) -> Vec<(u32, usize)> {
+/// expects one. With `fresh` the first frame must be the stream's opening keyframe. Returns
+/// `(frame_id, len)` of each.
+async fn receive(c: &mut ClientSession, fresh: bool) -> Vec<(u32, usize)> {
     let mut reassembler = Reassembler::new(ReassemblerConfig {
         frame_timeout_us: 10_000_000,
         ..ReassemblerConfig::for_refresh(REFRESH_MHZ)
@@ -117,8 +128,11 @@ async fn receive(c: &mut ClientSession) -> Vec<(u32, usize)> {
         assert_eq!(f.data, &want[..], "frame {} content", f.info.frame_id);
         assert!(f.data.len() > 1000, "realistic size");
         let key = f.info.flags.contains(FrameFlags::KEYFRAME);
-        if got.is_empty() {
-            assert!(key, "the stream starts with a keyframe");
+        if fresh && got.is_empty() {
+            assert!(
+                key && f.info.frame_id == 0,
+                "the stream starts with a keyframe"
+            );
         }
         if let Some(last) = got.last() {
             assert!(f.info.frame_id > last.0, "frames in order");
@@ -136,6 +150,19 @@ async fn receive(c: &mut ClientSession) -> Vec<(u32, usize)> {
     got
 }
 
+/// The QUIC application close code the host ended the session with.
+async fn close_code(c: &ClientSession) -> u64 {
+    match tokio::time::timeout(WAIT, c.closed())
+        .await
+        .expect("session ends")
+    {
+        Error::Connection(quinn::ConnectionError::ApplicationClosed(a)) => {
+            a.error_code.into_inner()
+        }
+        e => panic!("unexpected end: {e}"),
+    }
+}
+
 fn field(line: &str, name: &str) -> u64 {
     let key = format!("\"{name}\":");
     let start = line
@@ -149,41 +176,55 @@ fn field(line: &str, name: &str) -> u64 {
     digits.parse().unwrap()
 }
 
-/// Every line is a host frame record; ids and capture timestamps go up.
-fn check_telemetry(path: &Path, received: &[(u32, usize)]) -> usize {
+/// Every line is a whole host frame record; within a session frame ids go up, and capture
+/// timestamps (one host clock) never go down.
+fn telemetry(path: &Path) -> Vec<String> {
     let text = std::fs::read_to_string(path).unwrap();
-    let lines: Vec<&str> = text.lines().collect();
-    let mut prev: Option<(u64, u64)> = None;
-    for l in &lines {
+    let mut last_id = HashMap::new();
+    let mut last_capture = 0;
+    for l in text.lines() {
         assert!(
-            l.starts_with("{\"type\":\"host_frame\",") && l.ends_with('}'),
+            l.starts_with("{\"type\":\"host_frame\",\"session\":") && l.ends_with('}'),
             "{l}"
         );
-        let (id, cap) = (field(l, "frame_id"), field(l, "capture_us"));
+        let (session, id, cap) = (
+            field(l, "session"),
+            field(l, "frame_id"),
+            field(l, "capture_us"),
+        );
         assert!(field(l, "send_us") >= cap);
-        if let Some((pid, pcap)) = prev {
-            assert!(id > pid, "frame ids increase: {l}");
-            assert!(cap >= pcap, "capture timestamps are monotonic: {l}");
+        if let Some(prev) = last_id.insert(session, id) {
+            assert!(id > prev, "frame ids increase within a session: {l}");
         }
-        prev = Some((id, cap));
+        assert!(cap >= last_capture, "capture timestamps are monotonic: {l}");
+        last_capture = cap;
     }
+    text.lines().map(str::to_owned).collect()
+}
+
+/// Every received frame of `session` has its line, with the received size.
+fn assert_logged(lines: &[String], session: u64, received: &[(u32, usize)]) {
     for (id, len) in received {
         let line = lines
             .iter()
-            .find(|l| field(l, "frame_id") == u64::from(*id))
-            .unwrap_or_else(|| panic!("frame {id} is in the telemetry"));
+            .find(|l| field(l, "session") == session && field(l, "frame_id") == u64::from(*id))
+            .unwrap_or_else(|| panic!("session {session} frame {id} is in the telemetry"));
         assert_eq!(field(line, "encoded_bytes"), *len as u64);
     }
-    lines.len()
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn in_process_engine_streams_and_shuts_down_cleanly() {
-    let dir = scratch("inproc");
-    let tele = dir.join("t.jsonl");
+struct Running {
+    addr: SocketAddr,
+    fp: Fingerprint,
+    token: PairToken,
+    stop: tokio::sync::oneshot::Sender<()>,
+    run: tokio::task::JoinHandle<Result<(), Error>>,
+}
+
+fn start_engine(tele: &Path) -> Running {
     let cfg = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
-        telemetry_out: Some(tele.clone()),
+        telemetry_out: Some(tele.to_owned()),
         ..Config::default()
     };
     let engine = Engine::bind(&cfg, &Identity::generate().unwrap()).unwrap();
@@ -193,21 +234,106 @@ async fn in_process_engine_streams_and_shuts_down_cleanly() {
     let run = tokio::spawn(engine.run(async {
         let _ = stopped.await;
     }));
+    Running {
+        addr,
+        fp,
+        token,
+        stop,
+        run,
+    }
+}
 
-    let mut c = connect(addr, fp, token).await;
-    let received = receive(&mut c).await;
+impl Running {
+    async fn stop(self) {
+        self.stop.send(()).unwrap();
+        tokio::time::timeout(WAIT, self.run)
+            .await
+            .expect("engine stops promptly")
+            .unwrap()
+            .unwrap();
+    }
+}
 
-    stop.send(()).unwrap();
-    tokio::time::timeout(WAIT, run)
+#[tokio::test(flavor = "multi_thread")]
+async fn in_process_engine_streams_and_shuts_down_cleanly() {
+    let dir = scratch("inproc");
+    let tele = dir.join("t.jsonl");
+    let e = start_engine(&tele);
+    let client = new_client();
+    let mut c = client
+        .connect(e.addr, e.fp, Some(e.token.clone()))
         .await
-        .expect("engine stops promptly")
-        .unwrap()
         .unwrap();
-    tokio::time::timeout(WAIT, c.closed())
-        .await
-        .expect("client sees the session end");
+    start_stream(&mut c).await;
+    let received = receive(&mut c, true).await;
+
+    e.stop().await;
+    assert_eq!(close_code(&c).await, 0, "a clean stop closes with code 0");
     // After a clean stop the file is complete: every sent frame, every line whole.
-    assert!(check_telemetry(&tele, &received) >= FRAMES);
+    let lines = telemetry(&tele);
+    assert!(lines.len() >= FRAMES);
+    assert_logged(&lines, 0, &received);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sessions_are_refused_replaced_and_ended() {
+    let dir = scratch("sessions");
+    let tele = dir.join("t.jsonl");
+    let e = start_engine(&tele);
+    let tablet = new_client();
+    let mut a = tablet
+        .connect(e.addr, e.fp, Some(e.token.clone()))
+        .await
+        .unwrap();
+    start_stream(&mut a).await;
+    let first = receive(&mut a, true).await;
+
+    // A device without a token fails at the handshake, and the stream goes on.
+    let stranger = new_client();
+    assert!(stranger.connect(e.addr, e.fp, None).await.is_err());
+    let more = receive(&mut a, false).await;
+    assert!(more[0].0 > first.last().unwrap().0);
+
+    // The paired tablet reconnects: the new session replaces the old one.
+    let mut b = tablet.connect(e.addr, e.fp, None).await.unwrap();
+    assert_eq!(close_code(&a).await, 0, "replaced session closes normally");
+    start_stream(&mut b).await;
+    let second = receive(&mut b, true).await;
+
+    // Bye ends the session normally.
+    let bye = ControlMessage::Bye(Bye {
+        reason: ByeReason::Normal,
+    });
+    b.control_tx.send(&bye).await.unwrap();
+    assert_eq!(close_code(&b).await, 0);
+
+    // A message only the host may send is a protocol error.
+    let mut c = tablet.connect(e.addr, e.fp, None).await.unwrap();
+    let configure = ControlMessage::Configure(Configure {
+        profile: Profile::HevcMain,
+        width: 1,
+        height: 1,
+        refresh_mhz: REFRESH_MHZ,
+        bitrate_kbps: 1,
+    });
+    c.control_tx.send(&configure).await.unwrap();
+    assert_eq!(close_code(&c).await, 1);
+
+    // A refresh rate the engine does not stream at is refused, and stopping stays prompt.
+    let mut d = tablet.connect(e.addr, e.fp, None).await.unwrap();
+    assert_eq!(send_capabilities(&mut d, 1).await, None);
+    assert_eq!(close_code(&d).await, 1);
+    e.stop().await;
+
+    let lines = telemetry(&tele);
+    assert_logged(&lines, 0, &first);
+    assert_logged(&lines, 0, &more);
+    assert_logged(&lines, 1, &second);
+    assert!(
+        lines.iter().all(|l| field(l, "session") <= 1),
+        "sessions without a stream send no frames"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -262,8 +388,10 @@ async fn binary_streams_moving_bars_to_a_paired_client() {
     let fp = Fingerprint(unhex(param("fp")));
     let token = PairToken(unhex(param("t")));
 
-    let mut c = connect(addr, fp, token).await;
-    let received = receive(&mut c).await;
+    let client = new_client();
+    let mut c = client.connect(addr, fp, Some(token)).await.unwrap();
+    start_stream(&mut c).await;
+    let received = receive(&mut c, true).await;
 
     let id_file = if cfg!(windows) {
         data.join("Vetro").join("identity.bin")
@@ -277,7 +405,7 @@ async fn binary_streams_moving_bars_to_a_paired_client() {
         "the engine's identity is the stored one"
     );
 
-    // The writer flushes after every burst, so the file fills while the engine runs.
+    // The writer flushes after every poll, so the file fills while the engine runs.
     let last = format!("\"frame_id\":{},", received.last().unwrap().0);
     let deadline = Instant::now() + WAIT;
     loop {
@@ -293,6 +421,6 @@ async fn binary_streams_moving_bars_to_a_paired_client() {
     let text = std::fs::read_to_string(&tele).unwrap();
     let whole = &text[..=text.rfind('\n').unwrap()];
     std::fs::write(&tele, whole).unwrap();
-    check_telemetry(&tele, &received);
+    assert_logged(&telemetry(&tele), 0, &received);
     std::fs::remove_dir_all(&dir).unwrap();
 }

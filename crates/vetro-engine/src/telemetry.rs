@@ -8,16 +8,22 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
-/// Records buffered between the frame path and the writer: about 8 s at 120 fps.
+/// Records buffered between the frame path and the writer: about 8 s at 120 fps, far more than
+/// one poll interval.
 const RING: usize = 1024;
+/// How often the writer drains the channel.
+const POLL: Duration = Duration::from_millis(10);
 
 /// Host stage times of one sent frame, host clock in microseconds (same clock as the frame
 /// header's `capture_ts_us` and as clock-sync answers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameRecord {
+    /// Counts sessions from 0 since engine start; frame ids restart at 0 in each session.
+    pub session: u32,
     pub frame_id: u32,
     pub keyframe: bool,
     pub capture_us: u64,
@@ -35,7 +41,8 @@ impl FrameRecord {
     pub fn write_jsonl(&self, w: &mut impl Write) -> io::Result<()> {
         writeln!(
             w,
-            r#"{{"type":"host_frame","frame_id":{},"keyframe":{},"capture_us":{},"encode_start_us":{},"encode_end_us":{},"send_us":{},"encoded_bytes":{},"datagrams":{}}}"#,
+            r#"{{"type":"host_frame","session":{},"frame_id":{},"keyframe":{},"capture_us":{},"encode_start_us":{},"encode_end_us":{},"send_us":{},"encoded_bytes":{},"datagrams":{}}}"#,
+            self.session,
             self.frame_id,
             self.keyframe,
             self.capture_us,
@@ -78,8 +85,7 @@ impl Telemetry {
         })
     }
 
-    /// Never blocks. shortcut: std's bounded channel takes a brief internal lock to wake the
-    /// writer; swap in a true SPSC ring if HIL shows jitter from it.
+    /// Never blocks, never allocates, takes no lock (the writer polls, see [`write_all`]).
     pub fn record(&self, r: FrameRecord) {
         if let Some(tx) = &self.tx
             && let Err(TrySendError::Full(_)) = tx.try_send(r)
@@ -104,17 +110,21 @@ impl Telemetry {
     }
 }
 
-/// Writes records until every sender is gone, flushing after each burst so the file is
-/// readable while the engine runs.
+/// Writes records until every sender is gone, flushing after each poll so the file is readable
+/// while the engine runs. The writer polls instead of parking in `recv`: with no parked
+/// receiver, the frame path's `try_send` takes no lock and makes no wake-up syscall.
 fn write_all(rx: &Receiver<FrameRecord>, mut w: impl Write) -> io::Result<()> {
-    while let Ok(r) = rx.recv() {
-        r.write_jsonl(&mut w)?;
-        while let Ok(r) = rx.try_recv() {
-            r.write_jsonl(&mut w)?;
+    loop {
+        std::thread::sleep(POLL);
+        loop {
+            match rx.try_recv() {
+                Ok(r) => r.write_jsonl(&mut w)?,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return w.flush(),
+            }
         }
         w.flush()?;
     }
-    w.flush()
 }
 
 #[cfg(test)]
@@ -123,6 +133,7 @@ mod tests {
 
     fn rec(frame_id: u32) -> FrameRecord {
         FrameRecord {
+            session: 3,
             frame_id,
             keyframe: frame_id == 0,
             capture_us: 1_000 + u64::from(frame_id),
@@ -140,7 +151,7 @@ mod tests {
         rec(0).write_jsonl(&mut out).unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "{\"type\":\"host_frame\",\"frame_id\":0,\"keyframe\":true,\"capture_us\":1000,\
+            "{\"type\":\"host_frame\",\"session\":3,\"frame_id\":0,\"keyframe\":true,\"capture_us\":1000,\
              \"encode_start_us\":1001,\"encode_end_us\":1002,\"send_us\":1003,\
              \"encoded_bytes\":52083,\"datagrams\":41}\n"
         );

@@ -36,13 +36,17 @@ pub struct FrameMeta {
     pub encode_end_us: u64,
 }
 
+/// Longest a [`VideoSource::next_frame`] call may block, so stopping a session or the engine
+/// waits at most this long for the source thread.
+pub const MAX_BLOCK: Duration = Duration::from_millis(20);
+
 /// A producer of encoded frames (one access unit each), in order.
 pub trait VideoSource: Send + 'static {
     /// Waits for the next frame and writes its encoded bytes into `out` (cleared first; the
     /// buffer is reused, so steady state allocates nothing). `force_keyframe` asks for a frame
-    /// the decoder can start from. Returns `None` when no frame came within about one frame
-    /// interval (a still screen), so the caller can check for shutdown; it must never block
-    /// much longer than that.
+    /// the decoder can start from. Returns `None` when no frame came within [`MAX_BLOCK`] (a
+    /// still screen, a slow refresh), so the caller can check for shutdown; it must never block
+    /// longer than that (DDA: `AcquireNextFrame` with a timeout of at most `MAX_BLOCK`).
     fn next_frame(
         &mut self,
         force_keyframe: bool,
@@ -95,6 +99,11 @@ impl VideoSource for MovingBars {
     ) -> Option<FrameMeta> {
         let now = Instant::now();
         let due = *self.next.get_or_insert(now);
+        if due > now + MAX_BLOCK {
+            // A slow refresh: sleep one slice and let the caller check for shutdown.
+            std::thread::sleep(MAX_BLOCK);
+            return None;
+        }
         if due > now {
             std::thread::sleep(due - now);
         }
@@ -159,6 +168,21 @@ mod tests {
             assert!(meta.encode_end_us >= meta.encode_start_us);
             last_capture = meta.capture_us;
         }
+    }
+
+    #[test]
+    fn a_slow_refresh_never_blocks_past_max_block() {
+        let clock = Clock::new();
+        let mut s = MovingBars::new(1, 8_000); // one frame per 1000 s
+        let mut buf = Vec::new();
+        assert!(s.next_frame(false, &clock, &mut buf).is_some());
+        let t = Instant::now();
+        assert!(s.next_frame(false, &clock, &mut buf).is_none());
+        assert!(
+            t.elapsed() < MAX_BLOCK * 5,
+            "returned after {:?}",
+            t.elapsed()
+        );
     }
 
     #[test]

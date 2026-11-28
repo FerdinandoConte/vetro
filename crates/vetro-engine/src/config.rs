@@ -5,7 +5,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 /// Default listening address: every IPv4 interface (Wi-Fi and USB tethering), fixed port so a
-/// paired tablet finds the engine again after a restart. mDNS (M1-13) advertises it too.
+/// paired tablet finds the engine again after a restart. mDNS (M1-13) advertises it too, with
+/// A records only (this socket is IPv4-only). Why all interfaces is acceptable: ARCHITECTURE
+/// section 8, "Listening address".
 pub const DEFAULT_BIND: &str = "0.0.0.0:47800";
 
 /// Encoder bitrate until delay-based rate control exists.
@@ -21,7 +23,8 @@ usage: vetro-engine --no-vdd [--test-pattern moving-bars] [--bind <addr:port>]
   --bind <addr:port>        listening address (default 0.0.0.0:47800)
   --telemetry-out <file>    write one JSON line per sent frame (host clock, microseconds)
   --pair                    open a pairing window and print the pairing URI on stdout
-                            (what the tray's QR code will show, M1-12)";
+                            (what the tray's QR code will show, M1-12); needs --bind
+                            with the LAN address the tablet will dial";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestPattern {
@@ -82,6 +85,13 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Config>,
     }
     if !no_vdd {
         return Err("the virtual display arrives in M1-8; pass --no-vdd".into());
+    }
+    // The URI's `a=` must be an address the tablet can dial; listing interfaces is M1-13.
+    if cfg.pair && cfg.bind.ip().is_unspecified() {
+        return Err(format!(
+            "--pair needs the address the tablet will dial: pass --bind <LAN IP>:{}",
+            cfg.bind.port()
+        ));
     }
     Ok(Some(cfg))
 }
@@ -151,6 +161,9 @@ mod tests {
             "--no-vdd --telemetry-out",
             "--no-vdd --fast",
             "--no-vdd extra",
+            "--no-vdd --pair",
+            "--no-vdd --pair --bind 0.0.0.0:47800",
+            "--no-vdd --pair --bind [::]:47800",
         ] {
             assert!(parse(args(bad)).is_err(), "{bad:?} must be rejected");
         }

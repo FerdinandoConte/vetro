@@ -50,7 +50,11 @@ struct Session {
 unsafe impl Send for Session {}
 
 fn check(lib: &Lib, what: &str, r: i32) -> Result<(), Error> {
-    if r < 0 { Err(Error(lib.err(what, r))) } else { Ok(()) }
+    if r < 0 {
+        Err(Error(lib.err(what, r)))
+    } else {
+        Ok(())
+    }
 }
 
 impl Session {
@@ -80,7 +84,7 @@ impl Session {
         let lib = self.lib;
         let s = self.settings;
         let (w, h) = (to_int(s.width)?, to_int(s.height)?);
-        // SAFETY (whole block): each FFmpeg object is checked for null right after it is made
+        // SAFETY: (whole block) each FFmpeg object is checked for null right after it is made
         // and owned by `self` (freed in Drop); pointer fields are written only on objects
         // FFmpeg just allocated and has not initialised yet, as its API requires, through the
         // layouts declared in `ffi` (checked by major version at load).
@@ -94,7 +98,11 @@ impl Session {
             let d3d = (*hw).hwctx.cast::<ffi::AVD3D11VADeviceContext>();
             // FFmpeg releases this reference when the device context is freed.
             (*d3d).device = self.device.device.clone().into_raw();
-            check(lib, "D3D11 device context", (lib.av_hwdevice_ctx_init)(self.d3d_device))?;
+            check(
+                lib,
+                "D3D11 device context",
+                (lib.av_hwdevice_ctx_init)(self.d3d_device),
+            )?;
 
             // The input pool.
             self.d3d_frames = (lib.av_hwframe_ctx_alloc)(self.d3d_device);
@@ -113,7 +121,11 @@ impl Session {
             // capture's colour conversion (M1-9) renders into its own NV12 target and copies
             // it into the slot on the GPU.
             (*dfc).bind_flags = D3D11_BIND_DECODER.0 as u32;
-            check(lib, "D3D11 frame pool", (lib.av_hwframe_ctx_init)(self.d3d_frames))?;
+            check(
+                lib,
+                "D3D11 frame pool",
+                (lib.av_hwframe_ctx_init)(self.d3d_frames),
+            )?;
 
             let (pix_fmt, frames) = if self.backend.takes_d3d11_frames() {
                 (lib.pix_d3d11, self.d3d_frames)
@@ -142,15 +154,18 @@ impl Session {
                 (lib.pix_qsv, self.qsv_frames)
             };
 
-            let name = CString::new(self.backend.encoder_name(s.profile)).map_err(|_| Error("name".into()))?;
+            let name = CString::new(self.backend.encoder_name(s.profile))
+                .map_err(|_| Error("name".into()))?;
             let codec = lib.encoder(&name).map_err(Error)?;
             self.ctx = (lib.avcodec_alloc_context3)(codec);
             if self.ctx.is_null() {
                 return Err(Error("avcodec_alloc_context3 failed".into()));
             }
             let obj = self.ctx.cast::<c_void>();
-            lib.set(obj, "video_size", &format!("{w}x{h}")).map_err(Error)?;
-            lib.set_int(obj, "pixel_format", i64::from(pix_fmt)).map_err(Error)?;
+            lib.set(obj, "video_size", &format!("{w}x{h}"))
+                .map_err(Error)?;
+            lib.set_int(obj, "pixel_format", i64::from(pix_fmt))
+                .map_err(Error)?;
             // One tick per frame at the client's refresh (mHz / 1000 = frames per second); the
             // BRC sizes frames from `framerate`.
             let fps = ffi::AVRational {
@@ -158,7 +173,14 @@ impl Session {
                 den: 1000,
             };
             lib.write_field(self.ctx, lib.offsets.framerate, fps);
-            lib.write_field(self.ctx, lib.offsets.time_base, ffi::AVRational { num: fps.den, den: fps.num });
+            lib.write_field(
+                self.ctx,
+                lib.offsets.time_base,
+                ffi::AVRational {
+                    num: fps.den,
+                    den: fps.num,
+                },
+            );
             for (k, v) in self.backend.options(s.profile) {
                 lib.set(obj, k, &v).map_err(Error)?;
             }
@@ -169,7 +191,11 @@ impl Session {
             }
             // Owned by the codec context from here on (avcodec_free_context unrefs it).
             lib.write_field(self.ctx, lib.offsets.hw_frames_ctx, r);
-            check(lib, self.backend.encoder_name(s.profile), (lib.avcodec_open2)(self.ctx, codec, ptr::null_mut()))?;
+            check(
+                lib,
+                self.backend.encoder_name(s.profile),
+                (lib.avcodec_open2)(self.ctx, codec, ptr::null_mut()),
+            )?;
 
             self.input = (lib.av_frame_alloc)();
             self.mapped = (lib.av_frame_alloc)();
@@ -203,7 +229,11 @@ impl Session {
         // `ID3D11Texture2D*` and data[1] its array slice (libavutil/hwcontext_d3d11va.h); the
         // texture is borrowed only for this call, while the frame holds a reference.
         unsafe {
-            check(lib, "pool surface", (lib.av_hwframe_get_buffer)(self.d3d_frames, self.input, 0))?;
+            check(
+                lib,
+                "pool surface",
+                (lib.av_hwframe_get_buffer)(self.d3d_frames, self.input, 0),
+            )?;
             let raw = (*self.input).data[0].cast::<c_void>();
             let Some(texture) = ID3D11Texture2D::from_raw_borrowed(&raw).cloned() else {
                 (lib.av_frame_unref)(self.input);
@@ -218,7 +248,8 @@ impl Session {
             } else {
                 (*self.mapped).format = lib.pix_qsv;
                 (*self.mapped).hw_frames_ctx = (lib.av_buffer_ref)(self.qsv_frames);
-                let r = (lib.av_hwframe_map)(self.mapped, self.input, ffi::AV_HWFRAME_MAP_READ_WRITE);
+                let r =
+                    (lib.av_hwframe_map)(self.mapped, self.input, ffi::AV_HWFRAME_MAP_READ_WRITE);
                 if r < 0 {
                     (lib.av_frame_unref)(self.mapped);
                     (lib.av_frame_unref)(self.input);
@@ -257,7 +288,6 @@ impl Session {
             Ok(keyframe)
         }
     }
-
 }
 
 /// The FFmpeg encoder of the render adapter's vendor, with zero-copy D3D11 input.
@@ -321,7 +351,11 @@ impl FfmpegEncoder {
 
     /// Swaps in a finished replacement; never waits for one still opening.
     fn swap_if_ready(&mut self) -> Result<(), Error> {
-        if !self.replacement.as_ref().is_some_and(JoinHandle::is_finished) {
+        if !self
+            .replacement
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
             return Ok(());
         }
         let Some(t) = self.replacement.take() else {

@@ -241,7 +241,8 @@ fn search_dirs() -> Vec<PathBuf> {
     let mut buf = [0u16; 1024];
     // SAFETY: a null module handle means the executable; the buffer is valid for its length.
     let n = unsafe { GetModuleFileNameW(None, &mut buf) } as usize;
-    if n > 0 && n < buf.len()
+    if n > 0
+        && n < buf.len()
         && let Some(dir) = Path::new(&String::from_utf16_lossy(&buf[..n])).parent()
     {
         dirs.push(dir.to_owned());
@@ -273,10 +274,13 @@ macro_rules! sym {
         // NUL-terminated symbol name.
         let p = unsafe { GetProcAddress($module, PCSTR(name.as_ptr())) }
             .ok_or_else(|| format!("FFmpeg export {} missing", stringify!($name)))?;
+        // The target type is the `Lib` field (or `let`) this expression initialises.
+        #[allow(clippy::missing_transmute_annotations)]
         // SAFETY: the exported function has the C signature declared in `Lib` (from the
         // pinned headers; the major version is checked right after loading), and a function
         // pointer transmutes to another function pointer of the same size.
-        unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, _>(p) }
+        let f = unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, _>(p) };
+        f
     }};
 }
 
@@ -387,13 +391,21 @@ impl Lib {
         let off = |name: &CStr| {
             // SAFETY: `ctx` is a live AVCodecContext (an AVClass object); search flags 0 look
             // at its own options only.
-            let o = unsafe {
-                (self.av_opt_find)(ctx.cast(), name.as_ptr(), std::ptr::null(), 0, 0)
-            };
+            let o =
+                unsafe { (self.av_opt_find)(ctx.cast(), name.as_ptr(), std::ptr::null(), 0, 0) };
             // SAFETY: a non-null result points at a static AVOption.
-            (!o.is_null()).then(|| usize::try_from(unsafe { (*o).offset }).ok()).flatten()
+            (!o.is_null())
+                .then(|| usize::try_from(unsafe { (*o).offset }).ok())
+                .flatten()
         };
-        let found = [c"b", c"flags", c"flags2", c"hwaccel_flags", c"extra_hw_frames"].map(off);
+        let found = [
+            c"b",
+            c"flags",
+            c"flags2",
+            c"hwaccel_flags",
+            c"extra_hw_frames",
+        ]
+        .map(off);
         let offsets = match found {
             [Some(b), Some(f), Some(f2), Some(hw), Some(extra)]
                 if f == b + 8 && f2 == b + 12 && extra == hw + 4 && hw >= 16 && hw % 8 == 0 =>

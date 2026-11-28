@@ -2,7 +2,7 @@
 //! one-frame mailbox (ARCHITECTURE section 10: bounded queue, drop the oldest, pooled buffers).
 
 use crate::source::{Clock, FrameMeta, VideoSource};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use tokio::sync::Notify;
@@ -74,6 +74,8 @@ impl Mailbox {
 struct Flags {
     stop: AtomicBool,
     keyframe: AtomicBool,
+    /// Rate control's target; 0 = no change requested yet.
+    bitrate_kbps: AtomicU32,
 }
 
 /// The running source thread; dropping it joins the thread, which takes at most
@@ -96,7 +98,13 @@ impl Pump {
             .name("vetro-source".into())
             .spawn(move || {
                 let mut frame_id = 0u32;
+                let mut bitrate = 0;
                 while !f.stop.load(Ordering::Acquire) {
+                    let target = f.bitrate_kbps.load(Ordering::Acquire);
+                    if target != bitrate {
+                        bitrate = target;
+                        source.set_bitrate(target);
+                    }
                     let mut buf = mb.buffer();
                     let force = f.keyframe.swap(false, Ordering::AcqRel);
                     let Some(meta) = source.next_frame(force, &clock, &mut buf) else {
@@ -122,7 +130,8 @@ impl Pump {
                     if mb.publish(frame) {
                         // The frame just published depends on the dropped one: restart the
                         // chain. shortcut: the real pipeline should drop before encoding
-                        // (M1-7/M1-9), so no encoded frame is ever thrown away.
+                        // (capture waits for the mailbox, M1-9), so no encoded frame is ever
+                        // thrown away.
                         f.keyframe.store(true, Ordering::Release);
                     }
                 }
@@ -132,6 +141,11 @@ impl Pump {
             thread: Some(thread),
             mailbox,
         })
+    }
+
+    /// Rate control: the source retargets before its next frame.
+    pub fn set_bitrate(&self, kbps: u32) {
+        self.flags.bitrate_kbps.store(kbps, Ordering::Release);
     }
 
     /// The next frame the source makes will be a keyframe.
@@ -166,6 +180,7 @@ mod tests {
                 capture_us: 0,
                 encode_start_us: 0,
                 encode_end_us: 0,
+                bitrate_kbps: 0,
             },
             data,
         }

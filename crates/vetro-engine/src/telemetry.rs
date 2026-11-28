@@ -33,6 +33,10 @@ pub struct FrameRecord {
     pub send_us: u64,
     pub encoded_bytes: u32,
     pub datagrams: u32,
+    /// Encoder bitrate for this frame (rate control).
+    pub bitrate_kbps: u32,
+    /// Reed–Solomon parity sent with it.
+    pub fec_percent: u8,
 }
 
 impl FrameRecord {
@@ -41,7 +45,7 @@ impl FrameRecord {
     pub fn write_jsonl(&self, w: &mut impl Write) -> io::Result<()> {
         writeln!(
             w,
-            r#"{{"type":"host_frame","session":{},"frame_id":{},"keyframe":{},"capture_us":{},"encode_start_us":{},"encode_end_us":{},"send_us":{},"encoded_bytes":{},"datagrams":{}}}"#,
+            r#"{{"type":"host_frame","session":{},"frame_id":{},"keyframe":{},"capture_us":{},"encode_start_us":{},"encode_end_us":{},"send_us":{},"encoded_bytes":{},"datagrams":{},"bitrate_kbps":{},"fec_percent":{}}}"#,
             self.session,
             self.frame_id,
             self.keyframe,
@@ -51,6 +55,8 @@ impl FrameRecord {
             self.send_us,
             self.encoded_bytes,
             self.datagrams,
+            self.bitrate_kbps,
+            self.fec_percent,
         )
     }
 }
@@ -142,6 +148,8 @@ mod tests {
             send_us: 1_003,
             encoded_bytes: 52_083,
             datagrams: 41,
+            bitrate_kbps: 50_000,
+            fec_percent: 10,
         }
     }
 
@@ -153,7 +161,7 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "{\"type\":\"host_frame\",\"session\":3,\"frame_id\":0,\"keyframe\":true,\"capture_us\":1000,\
              \"encode_start_us\":1001,\"encode_end_us\":1002,\"send_us\":1003,\
-             \"encoded_bytes\":52083,\"datagrams\":41}\n"
+             \"encoded_bytes\":52083,\"datagrams\":41,\"bitrate_kbps\":50000,\"fec_percent\":10}\n"
         );
     }
 

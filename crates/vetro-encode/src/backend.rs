@@ -105,8 +105,7 @@ impl Backend {
                     ("g", i32::MAX.to_string()),
                 ]);
                 // av1_nvenc has no profile option; Main is its only 8-bit 4:2:0 profile.
-                if let Some(name) = profile_name(profile).filter(|_| codec(profile) != Codec::Av1)
-                {
+                if let Some(name) = profile_name(profile).filter(|_| codec(profile) != Codec::Av1) {
                     o.push(("profile", p(name)));
                 }
             }
@@ -339,7 +338,10 @@ mod tests {
             assert_eq!(opt(&a, k), Some(v), "amf {k}");
         }
         assert_eq!(
-            opt(&Backend::Amf.options(Profile::H264ConstrainedBaseline), "profile"),
+            opt(
+                &Backend::Amf.options(Profile::H264ConstrainedBaseline),
+                "profile"
+            ),
             Some("constrained_baseline")
         );
         let m = Backend::Mf.options(Profile::H264High);

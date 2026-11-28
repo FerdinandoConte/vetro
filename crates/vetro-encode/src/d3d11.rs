@@ -54,7 +54,9 @@ impl Device {
             let desc = unsafe { adapter.GetDesc1() }.map_err(win("adapter description"))?;
             let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
             let wanted = match luid {
-                Some(l) => l.LowPart == desc.AdapterLuid.LowPart && l.HighPart == desc.AdapterLuid.HighPart,
+                Some(l) => {
+                    l.LowPart == desc.AdapterLuid.LowPart && l.HighPart == desc.AdapterLuid.HighPart
+                }
                 None => !software,
             };
             if wanted {
@@ -66,7 +68,12 @@ impl Device {
         Err(Error("no matching hardware adapter".into()))
     }
 
-    fn on(adapter: &IDXGIAdapter1, vendor_id: u32, luid: LUID, adapter_name: String) -> Result<Self, Error> {
+    fn on(
+        adapter: &IDXGIAdapter1,
+        vendor_id: u32,
+        luid: LUID,
+        adapter_name: String,
+    ) -> Result<Self, Error> {
         let (mut device, mut context) = (None, None);
         // SAFETY: out-pointers to locals; an explicit adapter needs DRIVER_TYPE_UNKNOWN.
         unsafe {
@@ -153,8 +160,11 @@ impl Bars {
             };
             let mut tex = None;
             // SAFETY: `init` points at w×h×1.5 bytes that outlive the call.
-            unsafe { dev.device.CreateTexture2D(&desc, Some(&init), Some(&mut tex)) }
-                .map_err(win("pattern texture"))?;
+            unsafe {
+                dev.device
+                    .CreateTexture2D(&desc, Some(&init), Some(&mut tex))
+            }
+            .map_err(win("pattern texture"))?;
             phases.push(tex.ok_or(Error("no texture".into()))?);
         }
         Ok(Self { phases })
@@ -165,6 +175,9 @@ impl Bars {
         let src = &self.phases[(seq % 8) as usize];
         // SAFETY: both textures live on `dev`, are NV12 and the same size; `index` is a valid
         // array slice of `dst` (the encoder's pool) with one mip level.
-        unsafe { dev.context.CopySubresourceRegion(dst, index, 0, 0, 0, src, 0, None) };
+        unsafe {
+            dev.context
+                .CopySubresourceRegion(dst, index, 0, 0, 0, src, 0, None)
+        };
     }
 }

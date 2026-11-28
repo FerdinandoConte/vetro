@@ -93,8 +93,7 @@ impl RateController {
     pub fn on_feedback(&mut self, fb: &LinkFeedback, now_us: u64) -> Decision {
         self.fec_percent = fec_percent(fb.loss_permille);
         let received = f64::from(fb.received_kbps);
-        let overuse =
-            fb.delay_gradient_us >= OVERUSE_US || fb.loss_permille >= HEAVY_LOSS_PERMILLE;
+        let overuse = fb.delay_gradient_us >= OVERUSE_US || fb.loss_permille >= HEAVY_LOSS_PERMILLE;
         if overuse {
             let delivered = if received > 0.0 {
                 received.min(self.target)
@@ -217,7 +216,10 @@ mod tests {
         for _ in 0..400 {
             now += u64::from(TICK);
             if let Some(b) = rc.on_feedback(&calm(&rc), now).bitrate_kbps {
-                assert!(b > last && f64::from(b) <= f64::from(last) * 1.081, "{last} → {b}");
+                assert!(
+                    b > last && f64::from(b) <= f64::from(last) * 1.081,
+                    "{last} → {b}"
+                );
                 last = b;
             }
         }

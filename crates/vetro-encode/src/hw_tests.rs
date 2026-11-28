@@ -42,7 +42,8 @@ fn every_backend_option_is_known_to_the_pinned_ffmpeg() {
                 assert!(!ctx.is_null());
                 let obj = ctx.cast();
                 lib.set(obj, "video_size", "2960x1848").unwrap();
-                lib.set_int(obj, "pixel_format", i64::from(lib.pix_d3d11)).unwrap();
+                lib.set_int(obj, "pixel_format", i64::from(lib.pix_d3d11))
+                    .unwrap();
                 for (k, v) in b.options(p) {
                     lib.set(obj, k, &v)
                         .unwrap_or_else(|e| panic!("{name} ({p:?}): {e}"));
@@ -105,7 +106,10 @@ impl Decoder {
             let f = &*self.frame;
             assert!(y < usize::try_from(f.height).unwrap());
             let stride = usize::try_from(f.linesize[0]).unwrap();
-            let row = std::slice::from_raw_parts(f.data[0].add(y * stride), usize::try_from(f.width).unwrap());
+            let row = std::slice::from_raw_parts(
+                f.data[0].add(y * stride),
+                usize::try_from(f.width).unwrap(),
+            );
             let row = row.to_vec();
             (lib.av_frame_unref)(self.frame);
             Some(row)
@@ -192,7 +196,10 @@ fn qsv_encodes_a_gpu_texture_without_readback() {
             for t in [32, 33, 34] {
                 assert!(types.contains(&t), "frame {seq}: NAL {t} in {types:?}");
             }
-            assert!(types.iter().any(|t| (19..=20).contains(t)), "IDR in {types:?}");
+            assert!(
+                types.iter().any(|t| (19..=20).contains(t)),
+                "IDR in {types:?}"
+            );
         }
         let row = dec
             .decode(&mut au, h as usize / 2)
@@ -209,7 +216,10 @@ fn qsv_encodes_a_gpu_texture_without_readback() {
         if swapped_at.is_some_and(|s| seq >= s + 10) {
             break;
         }
-        assert!(Instant::now() < deadline, "replacement encoder never arrived");
+        assert!(
+            Instant::now() < deadline,
+            "replacement encoder never arrived"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
 }

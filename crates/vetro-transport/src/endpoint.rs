@@ -299,6 +299,13 @@ impl Host {
     pub fn close(&self) {
         self.endpoint.close(close_code::NORMAL.into(), b"");
     }
+
+    /// Resolves once every connection has finished closing, so the close packets have left
+    /// before the process exits. Bound it with a timeout: a peer that vanished is waited for
+    /// until its connection times out.
+    pub async fn wait_idle(&self) {
+        self.endpoint.wait_idle().await;
+    }
 }
 
 /// Setups in progress, oldest first.
@@ -478,19 +485,40 @@ pub struct HostSession {
     bufs: Mutex<SendBufs>,
 }
 
-impl HostSession {
+/// Accepts the client's streams apart from the session, so one task can wait for them while it
+/// also reads `control_rx` (a `&mut` borrow of the session) and keeps every stream drained.
+///
+/// It holds a handle on the connection, which stays open until the session and every acceptor
+/// are dropped (or [`HostSession::close`] is called): drop it together with the session.
+#[derive(Clone)]
+pub struct StreamAcceptor(Connection);
+
+impl StreamAcceptor {
     /// The next stream the client opens: input, then telemetry. Anything else closes the
     /// session.
-    pub async fn accept_stream(&self) -> Result<PeerStream, Error> {
-        let recv = self.conn.accept_uni().await?;
+    pub async fn accept(&self) -> Result<PeerStream, Error> {
+        let recv = self.0.accept_uni().await?;
         match recv.id().index() {
             0 => Ok(PeerStream::Input(MsgReceiver::new(recv))),
             1 => Ok(PeerStream::Telemetry(MsgReceiver::new(recv))),
             _ => {
-                close(&self.conn, close_code::PROTOCOL_ERROR);
+                close(&self.0, close_code::PROTOCOL_ERROR);
                 Err(Error::Protocol("unexpected stream from the client"))
             }
         }
+    }
+}
+
+impl HostSession {
+    /// The next stream the client opens: input, then telemetry. Anything else closes the
+    /// session.
+    pub async fn accept_stream(&self) -> Result<PeerStream, Error> {
+        self.stream_acceptor().accept().await
+    }
+
+    /// A handle that accepts the client's streams without borrowing the session.
+    pub fn stream_acceptor(&self) -> StreamAcceptor {
+        StreamAcceptor(self.conn.clone())
     }
 
     /// Largest datagram the path takes right now (grows with MTU discovery).

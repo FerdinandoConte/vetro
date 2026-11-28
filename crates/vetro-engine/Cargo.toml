@@ -7,3 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 publish.workspace = true
+
+[dependencies]
+vetro-protocol = { path = "../vetro-protocol" }
+vetro-transport = { path = "../vetro-transport" }
+tokio = { version = "1.54.1", default-features = false, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+# Already in the tree through vetro-transport; the tests read QUIC close codes.
+quinn = { version = "0.11.12", default-features = false }

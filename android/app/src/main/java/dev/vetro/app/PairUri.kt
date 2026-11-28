@@ -33,7 +33,7 @@ class PairUri(
             val token = hex(fields["t"], 16) ?: return null
             val addresses = (fields["a"] ?: return null).split(',')
             if (addresses.any { !isIp(it) }) return null
-            val port = fields["p"]?.takeIf { it.length <= 5 && it.all { c -> c in '0'..'9' } }?.toInt()
+            val port = fields["p"]?.takeIf { it.length in 1..5 && it.all { c -> c in '0'..'9' } }?.toInt()
             if (port == null || port !in 1..65535) return null
             return PairUri(fp, token, addresses, port)
         }

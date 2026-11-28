@@ -24,7 +24,7 @@ mod verify;
 
 pub use channel::{MsgReceiver, MsgSender};
 pub use endpoint::{
-    Client, ClientSession, Connecting, Host, HostSession, PeerStream, StreamAcceptor,
+    Client, ClientLink, ClientSession, Connecting, Host, HostSession, PeerStream, StreamAcceptor,
 };
 pub use identity::{Fingerprint, Identity};
 pub use pairing::PAIR_TOKEN_TTL;

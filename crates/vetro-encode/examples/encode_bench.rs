@@ -21,17 +21,22 @@ fn main() {
     use vetro_encode::d3d11::{Bars, Device};
     use vetro_encode::ffmpeg::FfmpegEncoder;
     use vetro_encode::{Encoder, Profile, Settings};
-    use windows::Win32::Foundation::FILETIME;
-    use windows::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+    use windows::Win32::System::Threading::GetCurrentThread;
+    use windows::Win32::System::WindowsProgramming::QueryThreadCycleTime;
 
-    fn cpu_us() -> u64 {
-        let (mut c, mut e, mut k, mut u) = Default::default();
-        // SAFETY: the pseudo-handle of the current thread and four out-parameters.
-        unsafe { GetThreadTimes(GetCurrentThread(), &mut c, &mut e, &mut k, &mut u) }
-            .expect("GetThreadTimes");
-        let t = |f: FILETIME| (u64::from(f.dwHighDateTime) << 32 | u64::from(f.dwLowDateTime)) / 10;
-        t(k) + t(u)
+    /// CPU cycles this thread has run (exact, unlike the 15.6 ms tick of GetThreadTimes).
+    fn cycles() -> u64 {
+        let mut c = 0;
+        // SAFETY: the pseudo-handle of the current thread and one out-parameter.
+        unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut c) }.expect("cycle time");
+        c
     }
+
+    // Cycles per millisecond: spin 100 ms (the thread runs the whole time).
+    let (t, c) = (Instant::now(), cycles());
+    while t.elapsed() < Duration::from_millis(100) {}
+    let per_ms = (cycles() - c) as f64 / (t.elapsed().as_secs_f64() * 1e3);
+    let cpu_ms = move || cycles() as f64 / per_ms;
 
     fn pct(mut v: Vec<f64>) -> String {
         v.sort_by(f64::total_cmp);
@@ -69,7 +74,7 @@ fn main() {
             }
             next = (next + interval).max(Instant::now());
         }
-        let (t, c) = (Instant::now(), cpu_us());
+        let (t, c) = (Instant::now(), cpu_ms());
         enc.encode(
             &mut |s| bars.draw(&dev, &s.texture, s.index, seq),
             seq == 0,
@@ -79,7 +84,7 @@ fn main() {
         // Skip the opening second: first IDR, pool warm-up.
         if seq >= hz {
             wall.push(t.elapsed().as_secs_f64() * 1e3);
-            cpu.push((cpu_us() - c) as f64 / 1e3);
+            cpu.push(cpu_ms() - c);
             bytes.push(au.len() as f64);
         }
         seq += 1;

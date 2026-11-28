@@ -213,16 +213,11 @@ async fn gpu_bars_stream_real_hevc_and_follow_rate_control() {
             "VPS/SPS/PPS in {t:?}"
         );
     }
-    // A keyframe without a request only follows a frame the mailbox dropped (an id gap
-    // right before it, ARCHITECTURE section 5.5).
+    // Frames are dropped before encoding, never after: every encoded frame arrives, in order,
+    // and none is an unasked keyframe (a P-frame never references a frame the client lacks).
     let ids: Vec<(u32, bool)> = first.iter().map(|f| (f.0, f.1)).collect();
-    for i in 1..ids.len() {
-        if ids[i].1 {
-            let gap = (1..=2).any(|k| i > k && ids[i - k].0 != ids[i - k - 1].0 + 1)
-                || ids[i].0 != ids[i - 1].0 + 1;
-            assert!(gap, "keyframe without a request or a drop: {ids:?}");
-        }
-    }
+    let want: Vec<(u32, bool)> = (0..30).map(|i| (i, i == 0)).collect();
+    assert_eq!(ids, want);
 
     // Queues building at 5 Mbit/s delivered: rate control backs off to 0.85 × 5000 after a
     // replacement encoder is swapped in (QSV), which shows as a keyframe.

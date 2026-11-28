@@ -12,8 +12,6 @@ publish.workspace = true
 vetro-protocol = { path = "../vetro-protocol" }
 bytes = "1.12.2"
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-# Only to name `RttEstimator` in the `Controller` impl; the same crate quinn already uses.
-quinn-proto = { version = "0.11.19", default-features = false }
 rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "ring"] }
 ring = "0.17.14"
 socket2 = "0.6.5"

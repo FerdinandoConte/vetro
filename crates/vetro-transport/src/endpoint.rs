@@ -23,8 +23,8 @@ use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{Connection, Endpoint, TransportConfig, VarInt};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::CertificateDer;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use vetro_protocol::Fragmenter;
@@ -46,9 +46,12 @@ const SOCKET_RECEIVE_BYTES: usize = 4 * 1024 * 1024;
 /// lost 12–14 % of frames on loopback and 1 MiB 0.2–0.8 % (M1-3). 1 MiB is about two large
 /// keyframes, or 160 ms at 50 Mbit/s if the link stalls (rate control must prevent that, M1-7).
 const DATAGRAM_SEND_QUEUE_BYTES: usize = 1024 * 1024;
-/// TLS handshakes plus `Hello` exchanges in progress at once; more incoming connections are
-/// refused, so a LAN flood during a pairing window cannot tie the host up.
-const MAX_SETUPS: usize = 8;
+/// TLS handshakes plus `Hello` exchanges in progress at once, in total and per remote IP; more
+/// incoming connections are refused. Slots are taken only after QUIC address validation
+/// (Retry), so spoofed sources cannot take any, and one real host cannot take more than 2.
+/// Worst case about 64 × 0.5 MiB of buffers (the connection receive window).
+const MAX_SETUPS: usize = 64;
+const MAX_SETUPS_PER_IP: usize = 2;
 
 /// One stream's flow-control window: its largest framed message (section 7.1).
 fn stream_window<M: StreamMessage>() -> u64 {
@@ -213,7 +216,7 @@ async fn with_timeout<T>(f: impl Future<Output = Result<T, Error>>) -> Result<T,
 pub struct Host {
     endpoint: Endpoint,
     trust: Arc<Trust>,
-    setups: Arc<AtomicUsize>,
+    setups: Arc<Setups>,
 }
 
 impl Host {
@@ -265,19 +268,27 @@ impl Host {
 
     /// The next incoming connection, or `None` once the endpoint is closed. Run
     /// [`Connecting::establish`] on its own task so a slow peer cannot hold up the others.
-    /// While [`MAX_SETUPS`] setups are in progress, further connections are refused.
+    ///
+    /// Every client first proves its address with a QUIC Retry (one extra round trip). While
+    /// [`MAX_SETUPS`] setups, or [`MAX_SETUPS_PER_IP`] from the same IP, are in progress,
+    /// further connections are refused.
     pub async fn accept(&self) -> Option<Connecting> {
         loop {
             let incoming = self.endpoint.accept().await?;
-            if self.setups.fetch_add(1, Ordering::AcqRel) >= MAX_SETUPS {
-                self.setups.fetch_sub(1, Ordering::AcqRel);
-                incoming.refuse();
+            if !incoming.remote_address_validated() {
+                if let Err(e) = incoming.retry() {
+                    e.into_incoming().refuse();
+                }
                 continue;
             }
+            let Some(slot) = self.setups.take(incoming.remote_address().ip()) else {
+                incoming.refuse();
+                continue;
+            };
             return Some(Connecting {
                 incoming,
                 trust: self.trust.clone(),
-                _slot: SetupSlot(self.setups.clone()),
+                _slot: slot,
             });
         }
     }
@@ -287,12 +298,51 @@ impl Host {
     }
 }
 
+/// Setups in progress per remote IP.
+#[derive(Default)]
+struct Setups(Mutex<HashMap<IpAddr, usize>>);
+
+impl Setups {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, usize>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn take(self: &Arc<Self>, ip: IpAddr) -> Option<SetupSlot> {
+        let ip = ip.to_canonical();
+        let mut map = self.lock();
+        let total: usize = map.values().sum();
+        let here = map.get(&ip).copied().unwrap_or(0);
+        if total >= MAX_SETUPS || here >= MAX_SETUPS_PER_IP {
+            return None;
+        }
+        *map.entry(ip).or_insert(0) += 1;
+        Some(SetupSlot {
+            setups: self.clone(),
+            ip,
+        })
+    }
+
+    #[cfg(test)]
+    fn in_progress(&self) -> usize {
+        self.lock().values().sum()
+    }
+}
+
 /// Frees one setup slot when the setup ends, however it ends.
-struct SetupSlot(Arc<AtomicUsize>);
+struct SetupSlot {
+    setups: Arc<Setups>,
+    ip: IpAddr,
+}
 
 impl Drop for SetupSlot {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        let mut map = self.setups.lock();
+        if let Some(n) = map.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&self.ip);
+            }
+        }
     }
 }
 
@@ -367,10 +417,12 @@ pub enum PeerStream {
 /// Datagram buffers reused across frames, so steady-state sending allocates nothing.
 #[derive(Default)]
 struct SendBufs {
-    /// Holds queued datagrams; `reserve` reclaims the allocation once quinn has sent and
+    /// Holds queued frame datagrams; `reserve` reclaims the allocation once quinn has sent and
     /// dropped every slice of the previous frame.
     datagrams: BytesMut,
-    cursor: Vec<u8>,
+    /// The same for cursor datagrams, kept apart so they never pin a frame buffer.
+    cursor: BytesMut,
+    cursor_scratch: Vec<u8>,
 }
 
 /// The host's side of a session.
@@ -445,10 +497,14 @@ impl HostSession {
     pub fn send_cursor(&self, pos: &CursorPosition) -> Result<(), Error> {
         let dgram = {
             let mut bufs = self.bufs.lock().unwrap_or_else(PoisonError::into_inner);
-            let SendBufs { datagrams, cursor } = &mut *bufs;
-            encode_cursor(pos, cursor);
-            datagrams.extend_from_slice(cursor);
-            datagrams.split().freeze()
+            let SendBufs {
+                cursor,
+                cursor_scratch,
+                ..
+            } = &mut *bufs;
+            encode_cursor(pos, cursor_scratch);
+            cursor.extend_from_slice(cursor_scratch);
+            cursor.split().freeze()
         };
         Ok(self.conn.send_datagram(dgram)?)
     }
@@ -723,20 +779,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn setups_beyond_the_cap_are_refused() {
-        let (id, c) = client();
-        let r = rig(&[id.fingerprint()]);
+    async fn one_source_holding_its_slots_does_not_lock_out_the_paired_tablet() {
+        let (_, flooder) = client();
+        let (tablet_id, tablet) = {
+            let id = Identity::generate().unwrap();
+            // Another source address: the whole 127.0.0.0/8 is loopback.
+            let c = Client::bind("127.0.0.2:0".parse().unwrap(), &id).unwrap();
+            (id, c)
+        };
+        let r = rig(&[tablet_id.fingerprint()]);
         let pin = r.host_id.fingerprint();
-        // Hold MAX_SETUPS slots: accepted, never established.
+
+        // The flooder holds every slot its IP may have: address-validated (Retry), never set up.
         let mut held = Vec::new();
         let mut dials = Vec::new();
-        for _ in 0..MAX_SETUPS {
-            dials.push(c.dial(r.addr, pin, transport_config(false)).unwrap());
+        for _ in 0..MAX_SETUPS_PER_IP {
+            dials.push(flooder.dial(r.addr, pin, transport_config(false)).unwrap());
             held.push(r.host.accept().await.unwrap());
         }
-        assert_eq!(r.host.setups.load(Ordering::Acquire), MAX_SETUPS);
-        // The next one is refused inside the accept loop, so its handshake fails.
-        let dial = c.dial(r.addr, pin, transport_config(false)).unwrap();
+        assert_eq!(r.host.setups.in_progress(), MAX_SETUPS_PER_IP);
+        // Its next attempt is refused inside the accept loop, so its handshake fails.
+        let dial = flooder.dial(r.addr, pin, transport_config(false)).unwrap();
         let refused = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::select! {
                 res = dial => res.is_err(),
@@ -746,7 +809,42 @@ mod tests {
         .await
         .expect("refusal within 5 s");
         assert!(refused);
+
+        // The paired tablet, from another address, still gets a session.
+        let (h, c) = tokio::join!(
+            async { r.host.accept().await.unwrap().establish().await },
+            tablet.connect(r.addr, pin, None),
+        );
+        assert!(h.is_ok() && c.is_ok(), "{:?} {:?}", h.err(), c.err());
         drop(held);
-        assert_eq!(r.host.setups.load(Ordering::Acquire), 0);
+        assert_eq!(r.host.setups.in_progress(), 0);
+    }
+
+    #[test]
+    fn setup_slots_are_capped_per_ip_and_in_total() {
+        let setups = Arc::new(Setups::default());
+        let ip = |i: u8| IpAddr::from([10, 0, 0, i]);
+        let mut slots = Vec::new();
+        for i in 0..(MAX_SETUPS / MAX_SETUPS_PER_IP) as u8 {
+            for _ in 0..MAX_SETUPS_PER_IP {
+                slots.push(setups.take(ip(i)).expect("under both caps"));
+            }
+            assert!(setups.take(ip(i)).is_none(), "per-IP cap");
+        }
+        assert_eq!(setups.in_progress(), MAX_SETUPS);
+        assert!(setups.take(ip(250)).is_none(), "global cap");
+        // A finished setup frees its slot.
+        slots.pop();
+        assert!(setups.take(ip(250)).is_some());
+        drop(slots);
+        assert_eq!(setups.in_progress(), 0);
+        assert!(setups.lock().is_empty());
+
+        // An IPv4-mapped IPv6 address counts as the same host.
+        let v4 = IpAddr::from([192, 168, 1, 5]);
+        let mapped = IpAddr::from(std::net::Ipv4Addr::new(192, 168, 1, 5).to_ipv6_mapped());
+        let _a = setups.take(v4).unwrap();
+        let _b = setups.take(mapped).unwrap();
+        assert!(setups.take(v4).is_none());
     }
 }

@@ -915,7 +915,6 @@ dependencies = [
  "bytes",
  "proptest",
  "quinn",
- "quinn-proto",
  "rcgen",
  "ring",
  "rustls",

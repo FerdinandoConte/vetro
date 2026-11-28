@@ -5,6 +5,7 @@
 //!   `Capabilities`, `Configure`, reassembly and FEC, keyframe requests, clock sync,
 //!   telemetry), driving any [`Decoder`].
 //! - [`clock`]: the session clock and NTP-style host clock alignment.
+//! - [`discovery`]: mDNS browse for hosts on the LAN (M1-13).
 //! - [`telemetry`]: per-frame stage times and lock-free session counters.
 //! - `android` (Android only): the NDK `AMediaCodec` decoder and the JNI surface for the app.
 //!
@@ -17,6 +18,7 @@
 mod android;
 pub mod clock;
 mod decoder;
+pub mod discovery;
 pub mod session;
 pub mod telemetry;
 

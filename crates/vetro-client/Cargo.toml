@@ -16,6 +16,7 @@ crate-type = ["cdylib", "rlib"]
 vetro-protocol = { path = "../vetro-protocol" }
 vetro-transport = { path = "../vetro-transport" }
 tokio = { version = "1.54.1", default-features = false, features = ["macros", "rt", "sync", "time"] }
+mdns-sd = { version = "0.22.0", default-features = false }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # jni-sys 0.3 is the version ndk-sys uses, so `JNIEnv` is the same type in both.

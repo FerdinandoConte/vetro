@@ -1,10 +1,11 @@
 //! Every parser of vetro-protocol on untrusted bytes: stream messages, datagrams, and a
-//! reassembler fed a datagram sequence cut from the same input. Run with
+//! reassembler fed a datagram sequence cut from the same input, and the mDNS TXT record. Run with
 //! `cargo +nightly fuzz run protocol` from `crates/vetro-protocol`.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
 use vetro_protocol::datagram::{Datagram, decode_datagram};
+use vetro_protocol::discovery::HostAdvert;
 use vetro_protocol::messages::{
     ControlMessage, InputMessage, StreamMessage, TelemetryMessage, decode_framed, encode_framed,
 };
@@ -29,6 +30,21 @@ fuzz_target!(|data: &[u8]| {
     stream::<InputMessage>(data);
     stream::<TelemetryMessage>(data);
     let _ = decode_datagram(data);
+
+    // mDNS TXT record: input = entries separated by NUL, each cut at the first '=' into key
+    // and value (an entry without '=' is a bare key). Accepted records must round-trip.
+    let entries = data.split(|b| *b == 0).filter_map(|e| {
+        let (k, v) = match e.iter().position(|b| *b == b'=') {
+            Some(i) => (&e[..i], Some(&e[i + 1..])),
+            None => (e, None),
+        };
+        Some((core::str::from_utf8(k).ok()?, v))
+    });
+    if let Ok(a) = HostAdvert::parse(entries) {
+        let txt = a.to_txt();
+        let again = txt.iter().map(|(k, v)| (*k, Some(v.as_bytes())));
+        assert_eq!(HostAdvert::parse(again), Ok(a));
+    }
 
     let cfg = ReassemblerConfig {
         max_in_flight: 3,

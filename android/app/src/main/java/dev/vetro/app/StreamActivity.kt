@@ -201,6 +201,7 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
         if (token != null && VetroCore.nativePaired(handle)) {
             store.save(host)
             token = null
+            intent.removeExtra(EXTRA_TOKEN)
         }
     }
 

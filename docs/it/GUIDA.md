@@ -206,12 +206,12 @@ Questo è il controllo fisico della tappa M1-6: collegare il tablet al motore. S
 
 **Cosa aspettarti, in onestà:** il motore, per ora, manda "frame finti" (byte senza un vero video: il codificatore arriva con la M1-7). Quindi **non vedrai ancora le barre colorate in movimento**. Quello che puoi controllare adesso è: l'abbinamento funziona, in alto a sinistra compare **Streaming** e il tablet resta a **120 Hz**. Con i dati finti il decodificatore può rifiutare i frame e dopo qualche secondo comparire "Connection failed": è atteso, non è un guasto. Scrivi a Claude cosa hai visto.
 
-1. **Scarica l'app.** In PowerShell (Claude ti dice il numero della prova automatica, qui `NUMERO`). Si scarica in una cartella temporanea, fuori dal progetto:
+1. **Scarica l'app.** Apri PowerShell nella cartella del progetto (`cd $HOME\Progetto_senza_nome`) e restaci per i punti 1 e 3. Claude ti dice il numero della prova automatica, qui `NUMERO`. Solo l'APK va in una cartella temporanea, fuori dal progetto:
    `gh run download NUMERO --name vetro-debug-apk --dir $env:TEMP\vetro-apk`
 2. **Installa sul tablet** (cavo USB collegato, ti chiede di consentire il debug: Consenti):
    `adb install -r $env:TEMP\vetro-apk\app-debug.apk`
    Se compare `INSTALL_FAILED_UPDATE_INCOMPATIBLE`, sul tablet c'è già una versione firmata in un altro modo: scrivi `adb uninstall dev.vetro.app` e rifai l'installazione. Attenzione: questo cancella anche gli abbinamenti salvati nell'app, quindi dovrai abbinare di nuovo.
-3. **Avvia il motore.** La prima volta Windows mostra la finestra del firewall: spunta solo **Reti private** (sezione 13).
+3. **Avvia il motore** (sempre da PowerShell nella cartella del progetto). La prima volta Windows mostra la finestra del firewall: spunta solo **Reti private** (sezione 13).
    `cargo run -p vetro-engine --release -- --no-vdd --pair`
    Il motore sceglie da solo l'indirizzo del PC sul Wi-Fi. Se invece dice che non ne trova uno, scrivi `ipconfig`, cerca sotto "Scheda Wi-Fi" la riga **Indirizzo IPv4** (per esempio `192.168.1.20`) e aggiungi `--bind 192.168.1.20:47800` al comando.
 4. **Il motore stampa una riga** che inizia con `vetro://pair?...`: è il codice di abbinamento. Vale **5 minuti** e **una volta sola**. Non incollarlo in chat, nelle issue, in un sito o in un messaggio a nessuno. Lascia il motore acceso.

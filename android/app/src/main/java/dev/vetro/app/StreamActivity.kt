@@ -3,6 +3,7 @@ package dev.vetro.app
 import android.app.Activity
 import android.graphics.Color
 import android.graphics.Typeface
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -86,7 +87,8 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
             it.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
             display?.let { d -> it.preferredDisplayModeId = bestMode(d).modeId }
         }
-        window.setDecorFitsSystemWindows(false)
+        // From API 35 (our target) windows are edge-to-edge already and the call is deprecated.
+        if (Build.VERSION.SDK_INT < 35) window.setDecorFitsSystemWindows(false)
         hideSystemBars()
 
         val surfaceView = SurfaceView(this)
@@ -155,8 +157,17 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
         if (handle != 0L) return
         val d = display ?: return
         val mode = bestMode(d)
-        // Ask the compositor to keep the panel at the stream rate (no seamless switches to lower rates).
-        holder.surface.setFrameRate(mode.refreshRate, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+        // Ask the compositor to hold the panel at the stream rate. API 30 has no strategy argument;
+        // from API 31 CHANGE_FRAME_RATE_ALWAYS also lets it switch modes (even with a visible seam) to get there.
+        if (Build.VERSION.SDK_INT >= 31) {
+            holder.surface.setFrameRate(
+                mode.refreshRate,
+                Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
+                Surface.CHANGE_FRAME_RATE_ALWAYS,
+            )
+        } else {
+            holder.surface.setFrameRate(mode.refreshRate, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+        }
         val w = maxOf(mode.physicalWidth, mode.physicalHeight)
         val h = minOf(mode.physicalWidth, mode.physicalHeight) // the activity is landscape
         handle = VetroCore.nativeStart(

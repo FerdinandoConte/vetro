@@ -101,6 +101,10 @@ class MainActivity : ComponentActivity() {
         }
         // shortcut: only the first address is tried (the engine prints one); try them in turn when it lists several.
         startStream(uri.addresses.first(), uri.port, uri.fingerprint, uri.token)
+        // The token is single-use: do not keep it in the field or in the intent that opened the app.
+        link = ""
+        pairing = false
+        setIntent(Intent(intent).setData(null))
     }
 
     @Composable

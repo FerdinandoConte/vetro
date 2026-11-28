@@ -21,6 +21,7 @@ import com.google.zxing.ReaderException
 import com.google.zxing.common.HybridBinarizer
 import com.google.zxing.qrcode.QRCodeReader
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** Back-camera preview that reports the text of every QR code it reads, on a camera thread. */
 @Composable
@@ -28,9 +29,11 @@ fun QrScanner(lifecycleOwner: LifecycleOwner, modifier: Modifier = Modifier, onT
     val context = LocalContext.current
     val executor = remember { Executors.newSingleThreadExecutor() }
     val provider = remember { arrayOfNulls<ProcessCameraProvider>(1) }
+    val disposed = remember { AtomicBoolean(false) }
     DisposableEffect(Unit) {
         onDispose {
             // The camera is bound to the activity's lifecycle, so it must be released by hand.
+            disposed.set(true)
             provider[0]?.unbindAll()
             executor.shutdown()
         }
@@ -39,6 +42,7 @@ fun QrScanner(lifecycleOwner: LifecycleOwner, modifier: Modifier = Modifier, onT
         val view = PreviewView(ctx)
         val future = ProcessCameraProvider.getInstance(ctx)
         future.addListener({
+            if (disposed.get()) return@addListener // left the screen before the camera provider was ready
             val p = future.get()
             provider[0] = p
             val preview = Preview.Builder().build().also { it.surfaceProvider = view.surfaceProvider }

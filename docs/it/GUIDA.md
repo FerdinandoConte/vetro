@@ -206,22 +206,23 @@ Questo è il controllo fisico della tappa M1-6: collegare il tablet al motore. S
 
 **Cosa aspettarti, in onestà:** il motore, per ora, manda "frame finti" (byte senza un vero video: il codificatore arriva con la M1-7). Quindi **non vedrai ancora le barre colorate in movimento**. Quello che puoi controllare adesso è: l'abbinamento funziona, in alto a sinistra compare **Streaming** e il tablet resta a **120 Hz**. Con i dati finti il decodificatore può rifiutare i frame e dopo qualche secondo comparire "Connection failed": è atteso, non è un guasto. Scrivi a Claude cosa hai visto.
 
-1. **Scarica l'app.** Nella cartella del progetto, in PowerShell (Claude ti dice il numero della prova automatica, qui `NUMERO`):
-   `gh run download NUMERO --name vetro-debug-apk --dir apk`
+1. **Scarica l'app.** In PowerShell (Claude ti dice il numero della prova automatica, qui `NUMERO`). Si scarica in una cartella temporanea, fuori dal progetto:
+   `gh run download NUMERO --name vetro-debug-apk --dir $env:TEMP\vetro-apk`
 2. **Installa sul tablet** (cavo USB collegato, ti chiede di consentire il debug: Consenti):
-   `adb install -r apkpp-debug.apk`
-3. **Trova l'indirizzo del PC:** in PowerShell scrivi `ipconfig` e cerca, sotto "Scheda Wi-Fi", la riga **Indirizzo IPv4** (per esempio `192.168.1.20`).
-4. **Avvia il motore** (al posto di `192.168.1.20` metti il tuo indirizzo). La prima volta Windows mostra la finestra del firewall: spunta solo **Reti private** (sezione 13).
-   `cargo run -p vetro-engine --release -- --no-vdd --bind 192.168.1.20:47800 --pair`
-5. **Il motore stampa una riga** che inizia con `vetro://pair?...`: è il codice di abbinamento. Vale **5 minuti** e **una volta sola**. Non incollarlo in chat, nelle issue o in un messaggio a nessuno.
-6. **Passa il codice al tablet.** Il motore stampa un testo, non ancora un disegno QR (il QR vero arriva con la M1-12). Due modi:
-   - **Con il cavo (più comodo):** copia la riga e in PowerShell scrivi il comando qui sotto, incollando la riga dove c'è `RIGA`. Tieni le virgolette come sono (doppie fuori, singole dentro).
+   `adb install -r $env:TEMP\vetro-apk\app-debug.apk`
+   Se compare `INSTALL_FAILED_UPDATE_INCOMPATIBLE`, sul tablet c'è già una versione firmata in un altro modo: scrivi `adb uninstall dev.vetro.app` e rifai l'installazione. Attenzione: questo cancella anche gli abbinamenti salvati nell'app, quindi dovrai abbinare di nuovo.
+3. **Avvia il motore.** La prima volta Windows mostra la finestra del firewall: spunta solo **Reti private** (sezione 13).
+   `cargo run -p vetro-engine --release -- --no-vdd --pair`
+   Il motore sceglie da solo l'indirizzo del PC sul Wi-Fi. Se invece dice che non ne trova uno, scrivi `ipconfig`, cerca sotto "Scheda Wi-Fi" la riga **Indirizzo IPv4** (per esempio `192.168.1.20`) e aggiungi `--bind 192.168.1.20:47800` al comando.
+4. **Il motore stampa una riga** che inizia con `vetro://pair?...`: è il codice di abbinamento. Vale **5 minuti** e **una volta sola**. Non incollarlo in chat, nelle issue, in un sito o in un messaggio a nessuno. Lascia il motore acceso.
+5. **Passa il codice al tablet.** Il motore stampa un testo, non ancora un disegno QR (il QR vero arriva con la M1-12). Due modi:
+   - **Con il cavo (più comodo):** apri una **seconda finestra PowerShell** (il motore resta acceso nella prima), copia la riga del motore e scrivi il comando qui sotto, incollando la riga dove c'è `RIGA`. Tieni le virgolette come sono (doppie fuori, singole dentro).
      `adb shell am start -a android.intent.action.VIEW -d "'RIGA'"`
      Sul tablet si apre Vetro con il codice già nel campo.
    - **A mano:** apri Vetro sul tablet, premi **Pair a new PC** e scrivi la riga nel campo.
-   Se invece hai un QR di quella riga (lo puoi fare con un generatore di QR sul PC), basta inquadrarlo con la camera: la prima volta Android chiede il permesso **Fotocamera**.
-7. **Sul tablet premi Pair.** Sullo schermo intero compare "Connecting...", poi **Streaming**, e sotto `panel 120 Hz, vsync 120/s`. Nel terminale del PC compare `session with ... (newly paired)`.
-8. **Scrivi a Claude cosa hai visto**: le due righe del tablet (testo e Hz) e se il PC ha scritto `newly paired`. Se compare **Not paired**, il codice era scaduto o già usato: riavvia il motore (punto 4) e riprova dal punto 5. Per uscire dallo schermo intero usa il gesto "indietro". Tre dita insieme sullo schermo mostrano o nascondono la scritta.
+   Se hai un QR di quella riga, basta inquadrarlo con la camera (la prima volta Android chiede il permesso **Fotocamera**). Il QR va fatto solo con un programma che funziona senza internet, **mai** con un sito: il codice è un segreto.
+6. **Sul tablet premi Pair.** Sullo schermo intero compare "Connecting...", poi **Streaming**, e sotto `panel 120 Hz, vsync 120/s`. Nel terminale del motore compare `session with ... (newly paired)`.
+7. **Scrivi a Claude cosa hai visto**: le due righe del tablet (testo e Hz) e se il PC ha scritto `newly paired`. Se compare **Not paired**, il codice era scaduto o già usato: riavvia il motore (punto 3) e riprova dal punto 4. Per uscire dallo schermo intero usa il gesto "indietro". Tre dita insieme sullo schermo mostrano o nascondono la scritta.
 
 Due limiti per ora: finché il motore non ricorda gli abbinamenti (M1-12), a ogni riavvio del motore devi rifare l'abbinamento; e la ricerca automatica del PC sul Wi-Fi (mDNS) non è ancora nell'app, quindi si usa il codice.
 

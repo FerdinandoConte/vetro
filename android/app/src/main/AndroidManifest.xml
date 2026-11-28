@@ -6,9 +6,11 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
-    <!-- allowBackup=false: identity.bin (the tablet's private key) and the paired hosts must not leave the device. -->
+    <!-- identity.bin (the tablet's private key) and the paired hosts must not leave the device:
+         allowBackup=false covers Android 11, dataExtractionRules covers 12+ (cloud backup and device transfer). -->
     <application
         android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:label="Vetro"
         android:theme="@android:style/Theme.Material.NoActionBar">
         <activity
@@ -19,11 +21,10 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            <!-- vetro://pair?... only pre-fills the pairing field; the owner still taps Pair. -->
+            <!-- vetro://pair?... only pre-fills the pairing field; the owner still taps Pair. Not BROWSABLE, so a web page cannot send it: only adb or an installed app. -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="vetro" android:host="pair" />
             </intent-filter>
         </activity>

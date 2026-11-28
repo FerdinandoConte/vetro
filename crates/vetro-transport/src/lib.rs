@@ -77,6 +77,8 @@ pub enum Error {
     Datagram(quinn::SendDatagramError),
     /// Setup took longer than [`SETUP_TIMEOUT`].
     Timeout,
+    /// The host was full and a newer connection took this setup's slot.
+    Evicted,
 }
 
 impl core::fmt::Display for Error {
@@ -96,6 +98,7 @@ impl core::fmt::Display for Error {
             Self::Fragment(e) => write!(f, "fragment: {e}"),
             Self::Datagram(e) => write!(f, "datagram: {e}"),
             Self::Timeout => f.write_str("session setup timed out"),
+            Self::Evicted => f.write_str("setup evicted: host busy with newer connections"),
         }
     }
 }

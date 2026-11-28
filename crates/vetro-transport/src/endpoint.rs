@@ -23,10 +23,12 @@ use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{Connection, Endpoint, TransportConfig, VarInt};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::CertificateDer;
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 use vetro_protocol::Fragmenter;
 use vetro_protocol::datagram::{CursorPosition, FrameInfo, encode_cursor};
 use vetro_protocol::messages::{
@@ -46,10 +48,11 @@ const SOCKET_RECEIVE_BYTES: usize = 4 * 1024 * 1024;
 /// lost 12–14 % of frames on loopback and 1 MiB 0.2–0.8 % (M1-3). 1 MiB is about two large
 /// keyframes, or 160 ms at 50 Mbit/s if the link stalls (rate control must prevent that, M1-7).
 const DATAGRAM_SEND_QUEUE_BYTES: usize = 1024 * 1024;
-/// TLS handshakes plus `Hello` exchanges in progress at once, in total and per remote IP; more
-/// incoming connections are refused. Slots are taken only after QUIC address validation
-/// (Retry), so spoofed sources cannot take any, and one real host cannot take more than 2.
-/// Worst case about 64 × 0.5 MiB of buffers (the connection receive window).
+/// TLS handshakes plus `Hello` exchanges in progress at once, in total and per remote IP.
+/// Slots are taken only after QUIC address validation (Retry), so spoofed sources take none.
+/// An IP over its limit is refused; a full host evicts its oldest setup instead, because one
+/// LAN host can own many valid addresses. Worst case about 64 × 0.5 MiB of buffers (the
+/// connection receive window).
 const MAX_SETUPS: usize = 64;
 const MAX_SETUPS_PER_IP: usize = 2;
 
@@ -269,9 +272,9 @@ impl Host {
     /// The next incoming connection, or `None` once the endpoint is closed. Run
     /// [`Connecting::establish`] on its own task so a slow peer cannot hold up the others.
     ///
-    /// Every client first proves its address with a QUIC Retry (one extra round trip). While
-    /// [`MAX_SETUPS`] setups, or [`MAX_SETUPS_PER_IP`] from the same IP, are in progress,
-    /// further connections are refused.
+    /// Every client first proves its address with a QUIC Retry (one extra round trip). An IP
+    /// that already has [`MAX_SETUPS_PER_IP`] setups in progress is refused; when [`MAX_SETUPS`]
+    /// are in progress, the oldest one is evicted to make room.
     pub async fn accept(&self) -> Option<Connecting> {
         loop {
             let incoming = self.endpoint.accept().await?;
@@ -288,7 +291,7 @@ impl Host {
             return Some(Connecting {
                 incoming,
                 trust: self.trust.clone(),
-                _slot: slot,
+                slot,
             });
         }
     }
@@ -298,51 +301,73 @@ impl Host {
     }
 }
 
-/// Setups in progress per remote IP.
+/// Setups in progress, oldest first.
 #[derive(Default)]
-struct Setups(Mutex<HashMap<IpAddr, usize>>);
+struct Setups(Mutex<VecDeque<Arc<SlotState>>>);
+
+struct SlotState {
+    ip: IpAddr,
+    evicted: AtomicBool,
+    wake: Notify,
+}
 
 impl Setups {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, usize>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<Arc<SlotState>>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// A slot for a setup from `ip`, or `None` if that IP already holds [`MAX_SETUPS_PER_IP`].
+    /// When all [`MAX_SETUPS`] are taken, the oldest setup is evicted (fresh beats complete),
+    /// so setups kept stalled from many addresses cannot keep the tablet out.
     fn take(self: &Arc<Self>, ip: IpAddr) -> Option<SetupSlot> {
         let ip = ip.to_canonical();
-        let mut map = self.lock();
-        let total: usize = map.values().sum();
-        let here = map.get(&ip).copied().unwrap_or(0);
-        if total >= MAX_SETUPS || here >= MAX_SETUPS_PER_IP {
+        let mut live = self.lock();
+        if live.iter().filter(|s| s.ip == ip).count() >= MAX_SETUPS_PER_IP {
             return None;
         }
-        *map.entry(ip).or_insert(0) += 1;
+        if live.len() >= MAX_SETUPS
+            && let Some(oldest) = live.pop_front()
+        {
+            oldest.evicted.store(true, Ordering::Release);
+            oldest.wake.notify_one();
+        }
+        let state = Arc::new(SlotState {
+            ip,
+            evicted: AtomicBool::new(false),
+            wake: Notify::new(),
+        });
+        live.push_back(state.clone());
         Some(SetupSlot {
             setups: self.clone(),
-            ip,
+            state,
         })
     }
 
     #[cfg(test)]
     fn in_progress(&self) -> usize {
-        self.lock().values().sum()
+        self.lock().len()
     }
 }
 
 /// Frees one setup slot when the setup ends, however it ends.
 struct SetupSlot {
     setups: Arc<Setups>,
-    ip: IpAddr,
+    state: Arc<SlotState>,
+}
+
+impl SetupSlot {
+    /// Resolves once a newer setup has evicted this one.
+    async fn evicted(&self) {
+        // `notify_one` stores a permit, so an eviction between the check and the wait is kept.
+        while !self.state.evicted.load(Ordering::Acquire) {
+            self.state.wake.notified().await;
+        }
+    }
 }
 
 impl Drop for SetupSlot {
     fn drop(&mut self) {
-        let mut map = self.setups.lock();
-        if let Some(n) = map.get_mut(&self.ip) {
-            *n -= 1;
-            if *n == 0 {
-                map.remove(&self.ip);
-            }
-        }
+        self.setups.lock().retain(|s| !Arc::ptr_eq(s, &self.state));
     }
 }
 
@@ -350,19 +375,32 @@ impl Drop for SetupSlot {
 pub struct Connecting {
     incoming: quinn::Incoming,
     trust: Arc<Trust>,
-    _slot: SetupSlot,
+    slot: SetupSlot,
 }
 
 impl Connecting {
     /// TLS handshake (client certificate pinned, or provisional during a pairing window), then
     /// `Hello` (version negotiated; for a new client, the pairing token checked first and
     /// redeemed last, so a setup that fails midway neither burns the token nor pins the client).
+    ///
+    /// `Err(Error::Evicted)` when a newer connection needed the slot while the host was full.
     pub async fn establish(self) -> Result<HostSession, Error> {
-        with_timeout(self.run()).await
+        let Self {
+            incoming,
+            trust,
+            slot,
+        } = self;
+        with_timeout(async {
+            tokio::select! {
+                res = Self::run(incoming, trust) => res,
+                () = slot.evicted() => Err(Error::Evicted),
+            }
+        })
+        .await
     }
 
-    async fn run(self) -> Result<HostSession, Error> {
-        let conn = self.incoming.accept()?.await?;
+    async fn run(incoming: quinn::Incoming, trust: Arc<Trust>) -> Result<HostSession, Error> {
+        let conn = incoming.accept()?.await?;
         let peer = peer_fingerprint(&conn)?;
         let (send, recv) = conn.accept_bi().await?;
         let mut control_tx = MsgSender::new(send, PRIORITY_CONTROL);
@@ -371,11 +409,11 @@ impl Connecting {
 
         // The verifier let an unknown certificate through only because a pairing window was
         // open; now the token decides, before the host sends anything.
-        let token = if self.trust.is_paired(&peer) {
+        let token = if trust.is_paired(&peer) {
             None
         } else {
             match hello.pair_token {
-                Some(t) if self.trust.token_matches(&t, Instant::now()) => Some(t),
+                Some(t) if trust.token_matches(&t, Instant::now()) => Some(t),
                 _ => {
                     close(&conn, close_code::NOT_PAIRED);
                     return Err(Error::NotPaired);
@@ -389,7 +427,7 @@ impl Connecting {
 
         let newly_paired = token.is_some();
         if let Some(t) = token
-            && !self.trust.redeem(&t, peer, Instant::now())
+            && !trust.redeem(&t, peer, Instant::now())
         {
             // Another device used the token, or it expired, while this setup ran.
             close(&conn, close_code::NOT_PAIRED);
@@ -821,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_slots_are_capped_per_ip_and_in_total() {
+    fn a_full_host_evicts_its_oldest_setup() {
         let setups = Arc::new(Setups::default());
         let ip = |i: u8| IpAddr::from([10, 0, 0, i]);
         let mut slots = Vec::new();
@@ -832,13 +870,15 @@ mod tests {
             assert!(setups.take(ip(i)).is_none(), "per-IP cap");
         }
         assert_eq!(setups.in_progress(), MAX_SETUPS);
-        assert!(setups.take(ip(250)).is_none(), "global cap");
-        // A finished setup frees its slot.
-        slots.pop();
-        assert!(setups.take(ip(250)).is_some());
-        drop(slots);
+        // Full: a newcomer evicts the oldest slot instead of being refused.
+        let newest = setups.take(ip(250)).expect("evicts, never refuses");
+        assert_eq!(setups.in_progress(), MAX_SETUPS);
+        assert!(slots[0].state.evicted.load(Ordering::Acquire));
+        assert!(!slots[1].state.evicted.load(Ordering::Acquire));
+        // The evicted IP may come back (it is under its limit again).
+        assert!(setups.take(ip(0)).is_some());
+        drop((slots, newest));
         assert_eq!(setups.in_progress(), 0);
-        assert!(setups.lock().is_empty());
 
         // An IPv4-mapped IPv6 address counts as the same host.
         let v4 = IpAddr::from([192, 168, 1, 5]);
@@ -846,5 +886,44 @@ mod tests {
         let _a = setups.take(v4).unwrap();
         let _b = setups.take(mapped).unwrap();
         assert!(setups.take(v4).is_none());
+    }
+
+    #[tokio::test]
+    async fn stalled_setups_from_many_addresses_do_not_lock_out_the_paired_tablet() {
+        let (tablet_id, tablet) = {
+            let id = Identity::generate().unwrap();
+            let c = Client::bind("127.0.0.2:0".parse().unwrap(), &id).unwrap();
+            (id, c)
+        };
+        let r = rig(&[tablet_id.fingerprint()]);
+        let pin = r.host_id.fingerprint();
+
+        // Fill every slot from 32 addresses (127.0.0.10..): address-validated, never set up.
+        let flooders: Vec<Client> = (0..(MAX_SETUPS / MAX_SETUPS_PER_IP) as u8)
+            .map(|i| {
+                let addr = SocketAddr::from(([127, 0, 0, 10 + i], 0));
+                Client::bind(addr, &Identity::generate().unwrap()).unwrap()
+            })
+            .collect();
+        let mut held = Vec::new();
+        let mut dials = Vec::new();
+        for f in &flooders {
+            for _ in 0..MAX_SETUPS_PER_IP {
+                dials.push(f.dial(r.addr, pin, transport_config(false)).unwrap());
+                held.push(r.host.accept().await.unwrap());
+            }
+        }
+        assert_eq!(r.host.setups.in_progress(), MAX_SETUPS);
+
+        // The paired tablet still gets a session; the oldest stalled setup gave way.
+        let (h, c) = tokio::join!(
+            async { r.host.accept().await.unwrap().establish().await },
+            tablet.connect(r.addr, pin, None),
+        );
+        assert!(h.is_ok() && c.is_ok(), "{:?} {:?}", h.err(), c.err());
+        let oldest = held.remove(0);
+        assert!(matches!(oldest.establish().await, Err(Error::Evicted)));
+        drop(held);
+        assert_eq!(r.host.setups.in_progress(), 0);
     }
 }

@@ -3,10 +3,13 @@
 //! M1-4 skeleton: command line, identity path, one session at a time, a synthetic
 //! [`source::VideoSource`] on its own thread, the per-frame send path and JSONL telemetry.
 //! Capture (M1-9), the encoder (M1-7), the virtual display (M1-8), input injection (M1-10) and
-//! the tray IPC (M1-12) slot in later.
+//! the tray IPC (M1-12) slot in later. `--test-pattern gpu-bars` already runs the real encoder
+//! (M1-7): bars drawn on the GPU, encoded zero-copy by the GPU's FFmpeg hardware encoder.
 //!
 //! Session flow (section 7): the client's `Capabilities` (with its display mode) starts the
-//! stream: the engine answers `Configure` and starts the source; `KeyframeRequest` forces the
+//! stream: the engine negotiates the codec (AV1 > HEVC > H.264), answers `Configure` and starts
+//! the source; the client's `LinkFeedback` drives the encoder bitrate and the FEC share
+//! (`vetro_encode::rate`); `KeyframeRequest` forces the
 //! next frame to be a keyframe; `ClockSyncRequest` is answered on the host clock that also
 //! stamps every frame. Every client stream is read for the whole session (section 8, flow
 //! control). A newly established session replaces the running one (fresh beats complete).
@@ -29,18 +32,16 @@ use std::sync::Arc;
 use std::time::Duration;
 use telemetry::{FrameRecord, Telemetry};
 use tokio::sync::mpsc;
+use vetro_encode::backend;
+use vetro_encode::rate::RateController;
 use vetro_protocol::Fragmenter;
 use vetro_protocol::messages::{
     Capabilities, ClockSyncResponse, Configure, ControlMessage, PairToken, Profile,
+    TelemetryMessage,
 };
 use vetro_transport::{
     Error, Fingerprint, Host, HostSession, Identity, MsgReceiver, PeerStream, close_code,
 };
-
-/// Reed–Solomon parity per frame.
-/// shortcut: fixed 10 %; section 7 wants adaptive 5–25 % on Wi-Fi from the client's measured
-/// loss (with rate control, M1-7) and 0 % on USB (M1-14).
-const FEC_PERCENT: u8 = 10;
 
 /// A control reply that cannot be queued in this time means the client stopped reading its
 /// control stream; the session is closed rather than left frozen.
@@ -55,6 +56,12 @@ const MIN_REFRESH_MHZ: u32 = 10_000;
 fn log(args: fmt::Arguments<'_>) {
     // Cold path only: session start/end and refused connections, never per frame.
     eprintln!("vetro-engine: {args}");
+}
+
+/// A running stream: the source thread and the rate controller that retargets it.
+struct Stream {
+    pump: Pump,
+    rate: RateController,
 }
 
 /// The bound endpoint plus everything a session needs.
@@ -227,7 +234,7 @@ impl Engine {
         let mut accepted = 0;
         let mut input = None;
         let mut client_telemetry = None;
-        let mut pump: Option<Pump> = None;
+        let mut stream: Option<Stream> = None;
         let mut fragmenter = Fragmenter::new();
 
         let (end, code, why) = loop {
@@ -237,7 +244,7 @@ impl Engine {
                     break (End::Replaced(Box::new(newer)), close_code::NORMAL, "replaced by a newer session".into());
                 }
                 msg = s.control_rx.recv() => match msg {
-                    Ok(Some(m)) => match self.on_control(&mut s, m, &mut pump).await {
+                    Ok(Some(m)) => match self.on_control(&mut s, m, &mut stream).await {
                         Ok(true) => {}
                         Ok(false) => break (End::Closed, close_code::NORMAL, "client said bye".into()),
                         Err(e) => break (End::Closed, close_code::PROTOCOL_ERROR, e.to_string()),
@@ -252,19 +259,29 @@ impl Engine {
                     }
                     Err(e) => break (End::Closed, close_code::PROTOCOL_ERROR, e.to_string()),
                 },
-                // shortcut: input is read and discarded until injection (M1-10), client
-                // telemetry until the HIL harness merges it (M1-11); reading keeps flow-control
-                // credit moving (section 8).
-                m = drain(&mut input) => if let Err(e) = m {
+                // shortcut: input is read and discarded until injection (M1-10); reading keeps
+                // flow-control credit moving (section 8).
+                m = next_msg(&mut input) => if let Err(e) = m {
                     break (End::Closed, close_code::PROTOCOL_ERROR, e.to_string());
                 },
-                m = drain(&mut client_telemetry) => if let Err(e) = m {
-                    break (End::Closed, close_code::PROTOCOL_ERROR, e.to_string());
+                // Client frame times wait for the HIL harness (M1-11); link reports drive
+                // rate control.
+                m = next_msg(&mut client_telemetry) => match m {
+                    Ok(Some(TelemetryMessage::LinkFeedback(fb))) => {
+                        if let Some(st) = &mut stream {
+                            let now = self.clock.now_us();
+                            if let Some(kbps) = st.rate.on_feedback(&fb, now).bitrate_kbps {
+                                st.pump.set_bitrate(kbps);
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => break (End::Closed, close_code::PROTOCOL_ERROR, e.to_string()),
                 },
-                frame = next_frame(pump.as_ref()) => {
-                    // `next_frame` only yields while a pump runs.
-                    if let Some(p) = &pump
-                        && let Err(e) = self.send(&s, session_no, &mut fragmenter, p, frame)
+                frame = next_frame(stream.as_ref().map(|st| &st.pump)) => {
+                    // `next_frame` only yields while a stream runs.
+                    if let Some(st) = &stream
+                        && let Err(e) = self.send(&s, session_no, &mut fragmenter, st, frame)
                     {
                         break (End::Closed, close_code::NORMAL, e.to_string());
                     }
@@ -274,7 +291,7 @@ impl Engine {
         s.close(code);
         drop(streams);
         // Joining the source thread blocks up to `source::MAX_BLOCK`: not on an async worker.
-        let _ = tokio::task::spawn_blocking(move || drop(pump)).await;
+        let _ = tokio::task::spawn_blocking(move || drop(stream)).await;
         log(format_args!("session with {} ended: {why}", s.peer));
         end
     }
@@ -284,19 +301,19 @@ impl Engine {
         &self,
         s: &mut HostSession,
         msg: ControlMessage,
-        pump: &mut Option<Pump>,
+        stream: &mut Option<Stream>,
     ) -> Result<bool, Error> {
         match msg {
             ControlMessage::Capabilities(caps) => {
                 // shortcut: a later Capabilities (mode change) is ignored until the virtual
                 // display can follow it (M1-8).
-                if pump.is_none() {
-                    *pump = Some(self.start_stream(s, caps).await?);
+                if stream.is_none() {
+                    *stream = Some(self.start_stream(s, caps).await?);
                 }
             }
             ControlMessage::KeyframeRequest(_) => {
-                if let Some(p) = pump {
-                    p.request_keyframe();
+                if let Some(st) = stream {
+                    st.pump.request_keyframe();
                 }
             }
             ControlMessage::ClockSyncRequest(r) => {
@@ -319,28 +336,39 @@ impl Engine {
         Ok(true)
     }
 
-    async fn start_stream(&self, s: &mut HostSession, caps: Capabilities) -> Result<Pump, Error> {
+    /// Negotiates the codec, opens the source, answers `Configure` and starts the pump.
+    async fn start_stream(&self, s: &mut HostSession, caps: Capabilities) -> Result<Stream, Error> {
         let d = caps
             .display
             .ok_or(Error::Protocol("client Capabilities without a display"))?;
         if d.refresh_mhz < MIN_REFRESH_MHZ {
             return Err(Error::Protocol("client refresh rate below 10 Hz"));
         }
+        // The host's list is known only by opening encoders: candidates are the client's
+        // profiles at this mode, best first (ADR-0005).
+        let candidates = backend::candidates(None, &caps.codecs, d.width, d.height, d.refresh_mhz);
+        let (pattern, kbps) = (self.cfg.pattern, self.cfg.bitrate_kbps);
+        let (w, h, hz) = (d.width, d.height, d.refresh_mhz);
+        // Opening a hardware encoder takes a few hundred ms: off the async workers.
+        let (source, profile) =
+            tokio::task::spawn_blocking(move || open_source(pattern, &candidates, w, h, hz, kbps))
+                .await
+                .map_err(|_| Error::Protocol("source setup panicked"))??;
+        if backend::is_experimental(profile) {
+            log(format_args!("streaming {profile:?} (experimental)"));
+        }
         let configure = Configure {
-            // shortcut: HEVC Main as on the reference hardware; negotiation is M1-7.
-            profile: Profile::HevcMain,
+            profile,
             width: d.width,
             height: d.height,
             refresh_mhz: d.refresh_mhz,
-            bitrate_kbps: self.cfg.bitrate_kbps,
+            bitrate_kbps: kbps,
         };
         send_control(s, &ControlMessage::Configure(configure)).await?;
-        let source: Box<dyn VideoSource> = match self.cfg.pattern {
-            TestPattern::MovingBars => {
-                Box::new(MovingBars::new(d.refresh_mhz, self.cfg.bitrate_kbps))
-            }
-        };
-        Ok(Pump::start(source, self.clock)?)
+        Ok(Stream {
+            pump: Pump::start(source, self.clock)?,
+            rate: RateController::new(kbps),
+        })
     }
 
     /// The per-frame path: fragment, queue, record. Allocates nothing in steady state. `Err`
@@ -350,10 +378,11 @@ impl Engine {
         s: &HostSession,
         session: u32,
         fragmenter: &mut Fragmenter,
-        pump: &Pump,
+        stream: &Stream,
         frame: EncodedFrame,
     ) -> Result<(), Error> {
-        let res = s.send_frame(fragmenter, frame.info, &frame.data, FEC_PERCENT);
+        let (pump, fec_percent) = (&stream.pump, stream.rate.fec_percent());
+        let res = s.send_frame(fragmenter, frame.info, &frame.data, fec_percent);
         let send_us = self.clock.now_us();
         let out = match res {
             Ok(datagrams) => {
@@ -370,6 +399,8 @@ impl Engine {
                     send_us,
                     encoded_bytes: u32::try_from(frame.data.len()).unwrap_or(u32::MAX),
                     datagrams: u32::try_from(datagrams).unwrap_or(u32::MAX),
+                    bitrate_kbps: frame.meta.bitrate_kbps,
+                    fec_percent,
                 });
                 Ok(())
             }
@@ -403,15 +434,89 @@ async fn next_frame(pump: Option<&Pump>) -> EncodedFrame {
     }
 }
 
-/// Reads and discards one message; a finished stream is set to `None` and never polled again.
-async fn drain<M: vetro_protocol::messages::StreamMessage>(
+/// Reads one message; a finished stream is set to `None` and never polled again.
+async fn next_msg<M: vetro_protocol::messages::StreamMessage>(
     rx: &mut Option<MsgReceiver<M>>,
-) -> Result<(), Error> {
+) -> Result<Option<M>, Error> {
     let Some(r) = rx else {
         return std::future::pending().await;
     };
-    if r.recv().await?.is_none() {
+    let m = r.recv().await?;
+    if m.is_none() {
         *rx = None;
     }
-    Ok(())
+    Ok(m)
+}
+
+/// The session's source and the profile it encodes. `candidates` is best first.
+fn open_source(
+    pattern: TestPattern,
+    candidates: &[Profile],
+    width: u32,
+    height: u32,
+    refresh_mhz: u32,
+    bitrate_kbps: u32,
+) -> Result<(Box<dyn VideoSource>, Profile), Error> {
+    let &best = candidates
+        .first()
+        .ok_or(Error::Protocol("no codec in common with the client"))?;
+    match pattern {
+        // No codec: the bytes are opaque, any profile will do.
+        TestPattern::MovingBars => Ok((Box::new(MovingBars::new(refresh_mhz, bitrate_kbps)), best)),
+        #[cfg(windows)]
+        TestPattern::GpuBars => gpu_bars(candidates, width, height, refresh_mhz, bitrate_kbps),
+        #[cfg(not(windows))]
+        TestPattern::GpuBars => {
+            let _ = (width, height);
+            Err(Error::Protocol("gpu-bars needs Windows"))
+        }
+    }
+}
+
+/// GPU bars into the render adapter's hardware encoder: the first candidate that opens.
+/// shortcut: the default hardware adapter; the VDD adapter's LUID comes with M1-8.
+#[cfg(windows)]
+fn gpu_bars(
+    candidates: &[Profile],
+    width: u32,
+    height: u32,
+    refresh_mhz: u32,
+    bitrate_kbps: u32,
+) -> Result<(Box<dyn VideoSource>, Profile), Error> {
+    use vetro_encode::Settings;
+    use vetro_encode::d3d11::{Bars, Device};
+    use vetro_encode::ffmpeg::{FfmpegEncoder, Surface};
+
+    let fail = |e: vetro_encode::Error| {
+        log(format_args!("encoder: {e}"));
+        Error::Protocol("no hardware encoder for the negotiated codecs")
+    };
+    let device = Device::open(None).map_err(fail)?;
+    let bars = Bars::new(&device, width, height).map_err(fail)?;
+    let mut last = vetro_encode::Error("no candidates".into());
+    for &profile in candidates {
+        let settings = Settings {
+            profile,
+            width,
+            height,
+            refresh_mhz,
+            bitrate_kbps,
+        };
+        match FfmpegEncoder::open(&device, &settings) {
+            Ok(enc) => {
+                log(format_args!(
+                    "encoding {profile:?} with {:?} on {}",
+                    enc.backend(),
+                    device.adapter
+                ));
+                let dev = device.clone();
+                let paint: source::Painter<Surface> =
+                    Box::new(move |s, seq| bars.draw(&dev, &s.texture, s.index, seq));
+                let src = source::Encoded::new(enc, paint, refresh_mhz);
+                return Ok((Box::new(src), profile));
+            }
+            Err(e) => last = e,
+        }
+    }
+    Err(fail(last))
 }

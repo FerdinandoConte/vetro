@@ -10,16 +10,19 @@ use std::path::PathBuf;
 /// section 8, "Listening address".
 pub const DEFAULT_BIND: &str = "0.0.0.0:47800";
 
-/// Encoder bitrate until delay-based rate control exists.
-/// shortcut: fixed 50 Mbit/s, replaced by rate control from `LinkFeedback` in M1-7.
+/// The stream's starting bitrate and the cap of delay-based rate control (`LinkFeedback`,
+/// `vetro_encode::rate`).
+/// shortcut: one fixed cap; a per-transport cap (USB vs Wi-Fi) comes with M1-14.
 pub const DEFAULT_BITRATE_KBPS: u32 = 50_000;
 
 pub const USAGE: &str = "\
-usage: vetro-engine --no-vdd [--test-pattern moving-bars] [--bind <addr:port>]
+usage: vetro-engine --no-vdd [--test-pattern moving-bars|gpu-bars] [--bind <addr:port>]
                     [--telemetry-out <file.jsonl>] [--pair]
 
   --no-vdd                  synthetic source, no virtual display driver (required until M1-8)
-  --test-pattern <name>     synthetic pattern: moving-bars (default)
+  --test-pattern <name>     moving-bars (default): opaque frames, no codec
+                            gpu-bars: bars drawn on the GPU and encoded by the GPU's
+                            hardware encoder through FFmpeg (Windows, needs FFmpeg)
   --bind <addr:port>        listening address (default 0.0.0.0:47800)
   --telemetry-out <file>    write one JSON line per sent frame (host clock, microseconds)
   --pair                    open a pairing window and print the pairing URI on stdout
@@ -31,6 +34,8 @@ The engine announces itself on the LAN as _vetro._udp (mDNS) when it has a LAN I
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestPattern {
     MovingBars,
+    /// Real encoder: GPU-drawn bars through FFmpeg, zero-copy (Windows).
+    GpuBars,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,7 +76,13 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Config>,
             "--test-pattern" => {
                 cfg.pattern = match value(flag)?.to_str() {
                     Some("moving-bars") => TestPattern::MovingBars,
-                    _ => return Err("--test-pattern: unknown pattern (known: moving-bars)".into()),
+                    Some("gpu-bars") if cfg!(windows) => TestPattern::GpuBars,
+                    Some("gpu-bars") => return Err("--test-pattern gpu-bars needs Windows".into()),
+                    _ => {
+                        return Err(
+                            "--test-pattern: unknown pattern (known: moving-bars, gpu-bars)".into(),
+                        );
+                    }
                 }
             }
             "--bind" => {
@@ -139,6 +150,12 @@ mod tests {
         assert_eq!(cfg.telemetry_out.as_deref(), Some(Path::new("t.jsonl")));
         assert!(cfg.pair);
         assert!(parse(args("--bind [::1]:9")).unwrap_err().contains("M1-8"));
+        let gpu = parse(args("--no-vdd --test-pattern gpu-bars"));
+        if cfg!(windows) {
+            assert_eq!(gpu.unwrap().unwrap().pattern, TestPattern::GpuBars);
+        } else {
+            assert!(gpu.is_err());
+        }
     }
 
     #[test]
@@ -149,6 +166,7 @@ mod tests {
             "",
             "--test-pattern moving-bars",
             "--no-vdd --test-pattern stripes",
+            "--no-vdd --test-pattern gpu",
             "--no-vdd --test-pattern",
             "--no-vdd --bind",
             "--no-vdd --bind localhost",

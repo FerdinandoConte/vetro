@@ -621,7 +621,7 @@ impl Client {
                 control_rx,
                 input_tx,
                 telemetry_tx,
-                conn,
+                link: ClientLink { conn },
             })
         })
         .await
@@ -647,10 +647,33 @@ pub struct ClientSession {
     pub control_rx: MsgReceiver<ControlMessage>,
     pub input_tx: MsgSender<InputMessage>,
     pub telemetry_tx: MsgSender<TelemetryMessage>,
-    conn: Connection,
+    link: ClientLink,
 }
 
 impl ClientSession {
+    /// A cloneable handle to the connection, so datagrams can be read while the stream halves
+    /// above are borrowed mutably elsewhere (one select loop needs both).
+    pub fn link(&self) -> ClientLink {
+        self.link.clone()
+    }
+}
+
+/// Session methods also work through the session itself.
+impl core::ops::Deref for ClientSession {
+    type Target = ClientLink;
+    fn deref(&self) -> &ClientLink {
+        &self.link
+    }
+}
+
+/// The `&self` half of a [`ClientSession`]. The connection stays open while the session or any
+/// handle is alive.
+#[derive(Clone)]
+pub struct ClientLink {
+    conn: Connection,
+}
+
+impl ClientLink {
     /// The host's telemetry stream. Anything else closes the session.
     pub async fn accept_telemetry(&self) -> Result<MsgReceiver<TelemetryMessage>, Error> {
         let recv = self.conn.accept_uni().await?;

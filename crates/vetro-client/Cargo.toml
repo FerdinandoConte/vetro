@@ -11,3 +11,7 @@ publish.workspace = true
 [lib]
 # cdylib is loaded by the Android app as libvetro_client.so; rlib lets x86 tests link it.
 crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+mdns-sd = { version = "0.22.0", default-features = false }
+vetro-protocol = { version = "0.0.0", path = "../vetro-protocol" }

@@ -24,30 +24,43 @@ use quinn::{Connection, Endpoint, TransportConfig, VarInt};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::CertificateDer;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use vetro_protocol::Fragmenter;
 use vetro_protocol::datagram::{CursorPosition, FrameInfo, encode_cursor};
 use vetro_protocol::messages::{
-    Bye, ByeReason, ControlMessage, Hello, InputMessage, PairToken, TelemetryMessage,
+    Bye, ByeReason, ControlMessage, Hello, InputMessage, PairToken, StreamMessage, TelemetryMessage,
 };
 use vetro_protocol::version::{ALPN, PROTOCOL_VERSION, Version, negotiate};
 
 /// SNI the client sends. Never checked: the host certificate is pinned by fingerprint.
 const SERVER_NAME: &str = "vetro";
 const HOST_DATAGRAM_RECEIVE_BYTES: usize = 2048;
-/// UDP socket buffers: room for whole frame bursts. With the OS defaults, 19–22 % of 52 kB frames
-/// were lost on Windows loopback; with 4 MiB, 0.3 % (M1-3, `examples/loopback_bench.rs`).
-const SOCKET_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+/// UDP socket receive buffer: room for whole frame bursts (measured in M1-3, see ARCHITECTURE
+/// section 9). The send buffer stays at the OS default: bytes there cannot be dropped.
+const SOCKET_RECEIVE_BYTES: usize = 4 * 1024 * 1024;
+/// quinn's datagram send queue, where the oldest datagrams are dropped first: the host's only
+/// sizeable send queue (the socket send buffer stays at the OS default). It must hold the
+/// frame being queued plus the tail of the previous one: with 400 kB frames at 120 fps, 512 KiB
+/// lost 12–14 % of frames on loopback and 1 MiB 0.2–0.8 % (M1-3). 1 MiB is about two large
+/// keyframes, or 160 ms at 50 Mbit/s if the link stalls (rate control must prevent that, M1-7).
+const DATAGRAM_SEND_QUEUE_BYTES: usize = 1024 * 1024;
+/// TLS handshakes plus `Hello` exchanges in progress at once; more incoming connections are
+/// refused, so a LAN flood during a pairing window cannot tie the host up.
+const MAX_SETUPS: usize = 8;
 
-/// Binds the UDP socket with large buffers, then wraps it in a quinn endpoint.
+/// One stream's flow-control window: its largest framed message (section 7.1).
+fn stream_window<M: StreamMessage>() -> u64 {
+    4 + M::MAX_BYTES as u64
+}
+
+/// Binds the UDP socket with a large receive buffer, then wraps it in a quinn endpoint.
 fn endpoint(addr: SocketAddr, server: Option<quinn::ServerConfig>) -> Result<Endpoint, Error> {
     let socket = std::net::UdpSocket::bind(addr)?;
-    let sock = socket2::SockRef::from(&socket);
     // Best effort: the OS may cap it (Linux and Android: net.core.rmem_max), and a smaller
     // buffer still works, only with more loss on bursts.
-    let _ = sock.set_recv_buffer_size(SOCKET_BUFFER_BYTES);
-    let _ = sock.set_send_buffer_size(SOCKET_BUFFER_BYTES);
+    let _ = socket2::SockRef::from(&socket).set_recv_buffer_size(SOCKET_RECEIVE_BYTES);
     let runtime = quinn::default_runtime()
         .ok_or_else(|| std::io::Error::other("not inside a tokio runtime"))?;
     Ok(Endpoint::new(
@@ -71,10 +84,17 @@ fn transport_config(host: bool) -> Arc<TransportConfig> {
             .expect("5 s fits a QUIC idle timeout"),
     ));
     t.keep_alive_interval(Some(KEEP_ALIVE));
+    t.datagram_send_buffer_size(DATAGRAM_SEND_QUEUE_BYTES);
+    // Flow control sized to the section 7.1 limits: one largest message per stream.
+    let control = stream_window::<ControlMessage>();
+    let telemetry = stream_window::<TelemetryMessage>();
+    t.stream_receive_window(VarInt::from_u64(control).expect("fits a varint"));
     if host {
         // What the client may open: control, input, telemetry.
         t.max_concurrent_bidi_streams(VarInt::from_u32(1));
         t.max_concurrent_uni_streams(VarInt::from_u32(2));
+        let total = control + stream_window::<InputMessage>() + telemetry;
+        t.receive_window(VarInt::from_u64(total).expect("fits a varint"));
         // quinn sends datagrams only with a receive buffer set. The host never reads client
         // datagrams: quinn drops the oldest beyond this, so they cost at most 2 KiB.
         t.datagram_receive_buffer_size(Some(HOST_DATAGRAM_RECEIVE_BYTES));
@@ -82,8 +102,46 @@ fn transport_config(host: bool) -> Arc<TransportConfig> {
         // What the host may open: telemetry only.
         t.max_concurrent_bidi_streams(VarInt::from_u32(0));
         t.max_concurrent_uni_streams(VarInt::from_u32(1));
+        t.receive_window(VarInt::from_u64(control + telemetry).expect("fits a varint"));
     }
     Arc::new(t)
+}
+
+/// The host's TLS config. Resumption is off: a resumed handshake would skip the verifier (and
+/// so an unpair). 0-RTT stays off (rustls default `max_early_data_size = 0`).
+fn host_tls(identity: &Identity, trust: Arc<Trust>) -> Result<rustls::ServerConfig, Error> {
+    let provider = provider();
+    let verifier = Arc::new(ClientPins::new(trust, &provider));
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(vec![identity.cert()], identity.key())?;
+    tls.alpn_protocols = vec![ALPN.to_vec()];
+    tls.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    tls.send_tls13_tickets = 0;
+    Ok(tls)
+}
+
+/// The client's quinn config: pins `host`, presents `identity`, no resumption, no 0-RTT.
+fn client_config(
+    identity: &Identity,
+    host: Fingerprint,
+    transport: Arc<TransportConfig>,
+) -> Result<quinn::ClientConfig, Error> {
+    let provider = provider();
+    let verifier = Arc::new(HostPin::new(host, &provider));
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(vec![identity.cert()], identity.key())?;
+    tls.alpn_protocols = vec![ALPN.to_vec()];
+    tls.resumption = rustls::client::Resumption::disabled();
+    let crypto =
+        QuicClientConfig::try_from(tls).map_err(|_| Error::Identity("no QUIC cipher suite"))?;
+    let mut cfg = quinn::ClientConfig::new(Arc::new(crypto));
+    cfg.transport_config(transport);
+    Ok(cfg)
 }
 
 fn close(conn: &Connection, code: u32) {
@@ -155,6 +213,7 @@ async fn with_timeout<T>(f: impl Future<Output = Result<T, Error>>) -> Result<T,
 pub struct Host {
     endpoint: Endpoint,
     trust: Arc<Trust>,
+    setups: Arc<AtomicUsize>,
 }
 
 impl Host {
@@ -166,23 +225,14 @@ impl Host {
         paired: impl IntoIterator<Item = Fingerprint>,
     ) -> Result<Self, Error> {
         let trust = Arc::new(Trust::new(paired));
-        let provider = provider();
-        let verifier = Arc::new(ClientPins::new(trust.clone(), &provider));
-        let mut tls = rustls::ServerConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])?
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(vec![identity.cert()], identity.key())?;
-        tls.alpn_protocols = vec![ALPN.to_vec()];
-        // No resumption: a resumed handshake would skip the verifier (and so an unpair).
-        tls.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
-        tls.send_tls13_tickets = 0;
-        let crypto =
-            QuicServerConfig::try_from(tls).map_err(|_| Error::Identity("no QUIC cipher suite"))?;
+        let crypto = QuicServerConfig::try_from(host_tls(identity, trust.clone())?)
+            .map_err(|_| Error::Identity("no QUIC cipher suite"))?;
         let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(crypto));
         cfg.transport_config(transport_config(true));
         Ok(Self {
             endpoint: endpoint(addr, Some(cfg))?,
             trust,
+            setups: Arc::default(),
         })
     }
 
@@ -196,8 +246,14 @@ impl Host {
         self.trust.start_pairing(Instant::now())
     }
 
+    /// Closes the pairing window (the tray hid the QR code): the token stops working and
+    /// unknown devices fail at the handshake again.
+    pub fn stop_pairing(&self) {
+        self.trust.stop_pairing();
+    }
+
     /// Forgets a client: its next handshake is rejected. Returns whether it was paired.
-    /// Sessions already running are the caller's to close.
+    /// Sessions already running are the caller's to close (M1-12).
     pub fn unpair(&self, client: &Fingerprint) -> bool {
         self.trust.unpair(client)
     }
@@ -209,12 +265,21 @@ impl Host {
 
     /// The next incoming connection, or `None` once the endpoint is closed. Run
     /// [`Connecting::establish`] on its own task so a slow peer cannot hold up the others.
+    /// While [`MAX_SETUPS`] setups are in progress, further connections are refused.
     pub async fn accept(&self) -> Option<Connecting> {
-        let incoming = self.endpoint.accept().await?;
-        Some(Connecting {
-            incoming,
-            trust: self.trust.clone(),
-        })
+        loop {
+            let incoming = self.endpoint.accept().await?;
+            if self.setups.fetch_add(1, Ordering::AcqRel) >= MAX_SETUPS {
+                self.setups.fetch_sub(1, Ordering::AcqRel);
+                incoming.refuse();
+                continue;
+            }
+            return Some(Connecting {
+                incoming,
+                trust: self.trust.clone(),
+                _slot: SetupSlot(self.setups.clone()),
+            });
+        }
     }
 
     pub fn close(&self) {
@@ -222,15 +287,26 @@ impl Host {
     }
 }
 
+/// Frees one setup slot when the setup ends, however it ends.
+struct SetupSlot(Arc<AtomicUsize>);
+
+impl Drop for SetupSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// A connection attempt the host has not set up yet.
 pub struct Connecting {
     incoming: quinn::Incoming,
     trust: Arc<Trust>,
+    _slot: SetupSlot,
 }
 
 impl Connecting {
     /// TLS handshake (client certificate pinned, or provisional during a pairing window), then
-    /// `Hello` (pairing token redeemed if the client is new, version negotiated).
+    /// `Hello` (version negotiated; for a new client, the pairing token checked first and
+    /// redeemed last, so a setup that fails midway neither burns the token nor pins the client).
     pub async fn establish(self) -> Result<HostSession, Error> {
         with_timeout(self.run()).await
     }
@@ -243,25 +319,32 @@ impl Connecting {
         let mut control_rx = MsgReceiver::new(recv);
         let hello = read_hello(&conn, &mut control_rx).await?;
 
-        let newly_paired = if self.trust.is_paired(&peer) {
-            false
+        // The verifier let an unknown certificate through only because a pairing window was
+        // open; now the token decides, before the host sends anything.
+        let token = if self.trust.is_paired(&peer) {
+            None
         } else {
-            // The verifier let an unknown certificate through only because a pairing window
-            // was open; now the token decides.
-            let redeemed = hello
-                .pair_token
-                .as_ref()
-                .is_some_and(|t| self.trust.redeem(t, peer, Instant::now()));
-            if !redeemed {
-                close(&conn, close_code::NOT_PAIRED);
-                return Err(Error::NotPaired);
+            match hello.pair_token {
+                Some(t) if self.trust.token_matches(&t, Instant::now()) => Some(t),
+                _ => {
+                    close(&conn, close_code::NOT_PAIRED);
+                    return Err(Error::NotPaired);
+                }
             }
-            true
         };
 
         control_tx.send(&our_hello()).await?;
         let version = agree(&conn, &mut control_tx, hello.version).await?;
         let telemetry_tx = MsgSender::new(conn.open_uni().await?, PRIORITY_TELEMETRY);
+
+        let newly_paired = token.is_some();
+        if let Some(t) = token
+            && !self.trust.redeem(&t, peer, Instant::now())
+        {
+            // Another device used the token, or it expired, while this setup ran.
+            close(&conn, close_code::NOT_PAIRED);
+            return Err(Error::NotPaired);
+        }
         Ok(HostSession {
             peer,
             version,
@@ -270,6 +353,7 @@ impl Connecting {
             control_rx,
             telemetry_tx,
             conn,
+            bufs: Mutex::default(),
         })
     }
 }
@@ -278,6 +362,15 @@ impl Connecting {
 pub enum PeerStream {
     Input(MsgReceiver<InputMessage>),
     Telemetry(MsgReceiver<TelemetryMessage>),
+}
+
+/// Datagram buffers reused across frames, so steady-state sending allocates nothing.
+#[derive(Default)]
+struct SendBufs {
+    /// Holds queued datagrams; `reserve` reclaims the allocation once quinn has sent and
+    /// dropped every slice of the previous frame.
+    datagrams: BytesMut,
+    cursor: Vec<u8>,
 }
 
 /// The host's side of a session.
@@ -292,6 +385,7 @@ pub struct HostSession {
     pub control_rx: MsgReceiver<ControlMessage>,
     pub telemetry_tx: MsgSender<TelemetryMessage>,
     conn: Connection,
+    bufs: Mutex<SendBufs>,
 }
 
 impl HostSession {
@@ -315,7 +409,7 @@ impl HostSession {
     }
 
     /// Fragments `frame` (with `fec_percent` parity) to the current datagram size and queues
-    /// every fragment. Returns the number of datagrams. When quinn's send buffer is full the
+    /// every fragment. Returns the number of datagrams. When quinn's send queue is full the
     /// oldest unsent datagrams are dropped (fresh beats complete, section 10).
     ///
     /// `Err(Error::Datagram(_))` loses only this frame (e.g. the path MTU shrank between sizing
@@ -334,11 +428,12 @@ impl HostSession {
         let chunks = fragmenter.fragment(info, frame, max, fec_percent)?;
         let count = chunks.len();
         let stride = chunks.clone().next().map_or(0, <[u8]>::len);
-        // shortcut: one allocation per frame (quinn takes owned `Bytes`, the slices below share
-        // it); pool these buffers if HIL shows allocator jitter.
-        let mut all = BytesMut::with_capacity(count * stride);
-        chunks.for_each(|c| all.extend_from_slice(c));
-        let all = all.freeze();
+        let all = {
+            let mut bufs = self.bufs.lock().unwrap_or_else(PoisonError::into_inner);
+            bufs.datagrams.reserve(count * stride);
+            chunks.for_each(|c| bufs.datagrams.extend_from_slice(c));
+            bufs.datagrams.split().freeze()
+        };
         for i in 0..count {
             self.conn
                 .send_datagram(all.slice(i * stride..(i + 1) * stride))?;
@@ -348,9 +443,14 @@ impl HostSession {
 
     /// Queues a cursor position datagram (latest wins on the client).
     pub fn send_cursor(&self, pos: &CursorPosition) -> Result<(), Error> {
-        let mut buf = Vec::with_capacity(16);
-        encode_cursor(pos, &mut buf);
-        Ok(self.conn.send_datagram(Bytes::from(buf))?)
+        let dgram = {
+            let mut bufs = self.bufs.lock().unwrap_or_else(PoisonError::into_inner);
+            let SendBufs { datagrams, cursor } = &mut *bufs;
+            encode_cursor(pos, cursor);
+            datagrams.extend_from_slice(cursor);
+            datagrams.split().freeze()
+        };
+        Ok(self.conn.send_datagram(dgram)?)
     }
 
     pub fn rtt(&self) -> Duration {
@@ -393,23 +493,18 @@ impl Client {
         host: Fingerprint,
         pair_token: Option<PairToken>,
     ) -> Result<ClientSession, Error> {
-        let provider = provider();
-        let verifier = Arc::new(HostPin::new(host, &provider));
-        let mut tls = rustls::ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])?
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_client_auth_cert(vec![self.identity.cert()], self.identity.key())?;
-        tls.alpn_protocols = vec![ALPN.to_vec()];
-        tls.resumption = rustls::client::Resumption::disabled();
-        let crypto =
-            QuicClientConfig::try_from(tls).map_err(|_| Error::Identity("no QUIC cipher suite"))?;
-        let mut cfg = quinn::ClientConfig::new(Arc::new(crypto));
-        cfg.transport_config(transport_config(false));
-        let connecting = self
-            .endpoint
-            .connect_with(cfg, addr, SERVER_NAME)
-            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+        self.connect_with(addr, host, pair_token, transport_config(false))
+            .await
+    }
+
+    async fn connect_with(
+        &self,
+        addr: SocketAddr,
+        host: Fingerprint,
+        pair_token: Option<PairToken>,
+        transport: Arc<TransportConfig>,
+    ) -> Result<ClientSession, Error> {
+        let connecting = self.dial(addr, host, transport)?;
         with_timeout(async move {
             let conn = connecting.await?;
             let (send, recv) = conn.open_bi().await?;
@@ -436,6 +531,18 @@ impl Client {
             })
         })
         .await
+    }
+
+    fn dial(
+        &self,
+        addr: SocketAddr,
+        host: Fingerprint,
+        transport: Arc<TransportConfig>,
+    ) -> Result<quinn::Connecting, Error> {
+        let cfg = client_config(&self.identity, host, transport)?;
+        self.endpoint
+            .connect_with(cfg, addr, SERVER_NAME)
+            .map_err(|e| Error::Io(std::io::Error::other(e)))
     }
 }
 
@@ -477,5 +584,169 @@ impl ClientSession {
 
     pub fn close(&self, code: u32) {
         close(&self.conn, code);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Misbehaving peers, built from the crate's own client config.
+    use super::*;
+    use vetro_protocol::messages::KeyframeRequest;
+
+    fn local() -> SocketAddr {
+        "127.0.0.1:0".parse().unwrap()
+    }
+
+    struct Rig {
+        host_id: Identity,
+        host: Host,
+        addr: SocketAddr,
+    }
+
+    fn rig(paired: &[Fingerprint]) -> Rig {
+        let host_id = Identity::generate().unwrap();
+        let host = Host::bind(local(), &host_id, paired.iter().copied()).unwrap();
+        let addr = host.local_addr().unwrap();
+        Rig {
+            host_id,
+            host,
+            addr,
+        }
+    }
+
+    fn client() -> (Identity, Client) {
+        let id = Identity::generate().unwrap();
+        let c = Client::bind(local(), &id).unwrap();
+        (id, c)
+    }
+
+    #[test]
+    fn host_tls_never_resumes_and_never_accepts_early_data() {
+        let tls = host_tls(&Identity::generate().unwrap(), Arc::default()).unwrap();
+        assert_eq!(tls.send_tls13_tickets, 0);
+        assert!(!tls.session_storage.can_cache());
+        assert_eq!(tls.max_early_data_size, 0);
+        assert_eq!(tls.alpn_protocols, vec![ALPN.to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_never_sends_hello_is_dropped_at_the_deadline() {
+        let (id, c) = client();
+        let r = rig(&[id.fingerprint()]);
+        let started = Instant::now();
+        let (h, conn) = tokio::join!(
+            async { r.host.accept().await.unwrap().establish().await },
+            async {
+                c.dial(r.addr, r.host_id.fingerprint(), transport_config(false))
+                    .unwrap()
+                    .await
+            },
+        );
+        let _conn = conn.unwrap(); // TLS done, then silence.
+        assert!(matches!(h, Err(Error::Timeout)));
+        assert!(started.elapsed() >= SETUP_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn a_first_message_other_than_hello_is_a_protocol_error() {
+        let (id, c) = client();
+        let r = rig(&[id.fingerprint()]);
+        let (h, ()) = tokio::join!(
+            async { r.host.accept().await.unwrap().establish().await },
+            async {
+                let conn = c
+                    .dial(r.addr, r.host_id.fingerprint(), transport_config(false))
+                    .unwrap()
+                    .await
+                    .unwrap();
+                let (send, _recv) = conn.open_bi().await.unwrap();
+                let mut tx = MsgSender::<ControlMessage>::new(send, PRIORITY_CONTROL);
+                let msg = ControlMessage::KeyframeRequest(KeyframeRequest { lost_frame_id: 0 });
+                tx.send(&msg).await.unwrap();
+                let _ = conn.closed().await;
+            },
+        );
+        assert!(matches!(h, Err(Error::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn a_setup_that_fails_after_hello_keeps_the_token_and_pins_nobody() {
+        let r = rig(&[]);
+        let pin = r.host_id.fingerprint();
+        let token = r.host.start_pairing().unwrap();
+
+        // This client grants the host no stream for telemetry, so the host's setup stalls
+        // after its Hello and hits the deadline.
+        let mut stingy = TransportConfig::default();
+        stingy.max_concurrent_uni_streams(VarInt::from_u32(0));
+        let (_, bad) = client();
+        let (h, c) = tokio::join!(
+            async { r.host.accept().await.unwrap().establish().await },
+            bad.connect_with(r.addr, pin, Some(token.clone()), Arc::new(stingy)),
+        );
+        assert!(matches!(h, Err(Error::Timeout)), "{:?}", h.err());
+        // The client got the host's Hello, so the host failed after it.
+        assert!(c.is_ok());
+        assert!(r.host.paired().is_empty());
+
+        // The token still pairs a well-behaved device.
+        let (good_id, good) = client();
+        let (h, c) = tokio::join!(
+            async { r.host.accept().await.unwrap().establish().await },
+            good.connect(r.addr, pin, Some(token)),
+        );
+        assert!(h.unwrap().newly_paired && c.is_ok());
+        assert_eq!(r.host.paired(), vec![good_id.fingerprint()]);
+    }
+
+    #[tokio::test]
+    async fn a_third_client_stream_closes_the_session() {
+        let (id, c) = client();
+        let r = rig(&[id.fingerprint()]);
+        let (h, s) = tokio::join!(
+            async { r.host.accept().await.unwrap().establish().await },
+            c.connect(r.addr, r.host_id.fingerprint(), None),
+        );
+        let (h, mut s) = (h.unwrap(), s.unwrap());
+        s.input_tx.finish().unwrap();
+        s.telemetry_tx.finish().unwrap();
+        for _ in 0..2 {
+            match h.accept_stream().await.unwrap() {
+                PeerStream::Input(mut rx) => assert!(rx.recv().await.unwrap().is_none()),
+                PeerStream::Telemetry(mut rx) => assert!(rx.recv().await.unwrap().is_none()),
+            }
+        }
+        // Both streams are fully read, so the host grants new credit; a third stream is index 2.
+        let mut extra = s.conn.open_uni().await.unwrap();
+        extra.write_all(&[0, 0, 0, 0]).await.unwrap();
+        assert!(matches!(h.accept_stream().await, Err(Error::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn setups_beyond_the_cap_are_refused() {
+        let (id, c) = client();
+        let r = rig(&[id.fingerprint()]);
+        let pin = r.host_id.fingerprint();
+        // Hold MAX_SETUPS slots: accepted, never established.
+        let mut held = Vec::new();
+        let mut dials = Vec::new();
+        for _ in 0..MAX_SETUPS {
+            dials.push(c.dial(r.addr, pin, transport_config(false)).unwrap());
+            held.push(r.host.accept().await.unwrap());
+        }
+        assert_eq!(r.host.setups.load(Ordering::Acquire), MAX_SETUPS);
+        // The next one is refused inside the accept loop, so its handshake fails.
+        let dial = c.dial(r.addr, pin, transport_config(false)).unwrap();
+        let refused = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                res = dial => res.is_err(),
+                _ = r.host.accept() => false,
+            }
+        })
+        .await
+        .expect("refusal within 5 s");
+        assert!(refused);
+        drop(held);
+        assert_eq!(r.host.setups.load(Ordering::Acquire), 0);
     }
 }

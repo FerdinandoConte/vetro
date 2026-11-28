@@ -63,6 +63,17 @@ impl Trust {
         Ok(token)
     }
 
+    /// Closes the pairing window: the live token, if any, stops working.
+    pub(crate) fn stop_pairing(&self) {
+        self.lock().pending = None;
+    }
+
+    /// Whether `token` equals the live token (constant-time `==`), without consuming it. The
+    /// host checks this first and redeems only once the rest of the session setup succeeded.
+    pub(crate) fn token_matches(&self, token: &PairToken, now: Instant) -> bool {
+        self.lock().live_token(now) == Some(token)
+    }
+
     /// Single use: if `token` equals the live token (constant-time `==`), consumes it and pins
     /// `fp`. A wrong token leaves the live one in place, so a LAN peer guessing cannot cancel
     /// the owner's pairing; 128 random bits make guessing hopeless anyway.
@@ -152,6 +163,30 @@ mod tests {
         let t = Trust::default();
         assert!(!t.pairing_open(Instant::now()));
         assert!(!t.redeem(&PairToken([0; 16]), A, Instant::now()));
+    }
+
+    #[test]
+    fn checking_a_token_does_not_consume_it() {
+        let t = Trust::default();
+        let now = Instant::now();
+        let token = t.start_pairing(now).unwrap();
+        assert!(t.token_matches(&token, now));
+        assert!(t.token_matches(&token, now));
+        assert!(!t.token_matches(&PairToken([0; 16]), now));
+        assert!(!t.token_matches(&token, now + PAIR_TOKEN_TTL));
+        let token = t.start_pairing(now).unwrap();
+        assert!(t.redeem(&token, A, now));
+        assert!(!t.token_matches(&token, now));
+    }
+
+    #[test]
+    fn stop_pairing_closes_the_window() {
+        let t = Trust::default();
+        let now = Instant::now();
+        let token = t.start_pairing(now).unwrap();
+        t.stop_pairing();
+        assert!(!t.pairing_open(now));
+        assert!(!t.redeem(&token, A, now));
     }
 
     #[test]

@@ -79,12 +79,26 @@ impl Identity {
 
     /// Loads the identity stored at `path`, or creates one there if the file does not exist.
     ///
-    /// Writes nothing but `path` (created new, owner-only on Unix; on Windows the caller picks a
-    /// per-user directory). A file that exists but does not parse is an error, never replaced:
-    /// replacing it would silently change the fingerprint and break every pairing.
+    /// Writes nothing but `path` (created new, owner-only on Unix). A file that exists but does
+    /// not parse is an error, never replaced: replacing it would silently change the fingerprint
+    /// and break every pairing.
+    ///
+    /// The key is stored unencrypted. On Windows its only protection is the directory's ACL, so
+    /// the caller must pass a per-user directory: the engine uses `%LOCALAPPDATA%\Vetro\`
+    /// (M1-4), never ProgramData or a temp directory. On Unix (Android) a file that group or
+    /// others can read is refused.
     pub fn load_or_generate(path: &Path) -> Result<Self, Error> {
         match std::fs::File::open(path) {
             Ok(f) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if f.metadata()?.permissions().mode() & 0o077 != 0 {
+                        return Err(Error::Identity(
+                            "identity file is readable by other users; make it owner-only (0600)",
+                        ));
+                    }
+                }
                 let mut bytes = Vec::new();
                 f.take(MAX_FILE as u64 + 1).read_to_end(&mut bytes)?;
                 Self::from_bytes(&bytes)
@@ -212,6 +226,20 @@ mod tests {
         assert!(Identity::load_or_generate(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"garbage");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_others_can_read_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("vetro-id-perm-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Identity::load_or_generate(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(Identity::load_or_generate(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
     }
 
     proptest! {

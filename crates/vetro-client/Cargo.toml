@@ -11,3 +11,17 @@ publish.workspace = true
 [lib]
 # cdylib is loaded by the Android app as libvetro_client.so; rlib lets x86 tests link it.
 crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+vetro-protocol = { path = "../vetro-protocol" }
+vetro-transport = { path = "../vetro-transport" }
+tokio = { version = "1.54.1", default-features = false, features = ["macros", "rt", "sync", "time"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# jni-sys 0.3 is the version ndk-sys uses, so `JNIEnv` is the same type in both.
+jni-sys = "0.3.0"
+libc = "0.2.191"
+ndk-sys = { version = "0.6.0", features = ["media"] }
+
+[dev-dependencies]
+tokio = { version = "1.54.1", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
